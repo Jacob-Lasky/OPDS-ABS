@@ -132,23 +132,38 @@ class CollectionFeedGenerator(BaseFeedGenerator):
             return self.filter_items(data)
 
     async def generate_collection_items_feed(self, username, library_id, collection_id, token=None,
-                                             page=1, per_page=None):
+                                             params=None):
         """Generate a feed of items in a specific collection.
+
+        Paginates with the same 1-based ``start_index`` scheme as the library items
+        feed. DO NOT reintroduce a ``page=`` query parameter here: the OPDS routes
+        forward raw query params and the shared ``add_pagination_links`` helper emits
+        ``start_index``, so a ``page=`` parameter is never read back and the feed
+        silently pins to the first page forever.
 
         Args:
             username (str): The username requesting the feed.
             library_id (str): The ID of the library to generate the feed for.
             collection_id (str): The ID of the collection to filter by.
             token (str, optional): Authentication token for Audiobookshelf.
-            page (int): The page number to display (1-indexed).
-            per_page (int): Number of books per page.
+            params (dict, optional): Raw query parameters; ``start_index`` is honored.
 
         Returns:
             Response: A FastAPI response object containing the XML feed.
         """
         try:
-            logger.debug("Generating collection items feed for collection %s (page %d)",
-                        collection_id, page)
+            params = params if params else {}
+
+            # Extract pagination parameters (1-based, OpenSearch style)
+            try:
+                start_index = int(params.get('start_index', 1))
+                if start_index < 1:
+                    start_index = 1
+            except (ValueError, TypeError):
+                start_index = 1
+
+            logger.debug("Generating collection items feed for collection %s (start_index %d)",
+                        collection_id, start_index)
 
             # Get collection details first to get the name
             collection_info = await self.get_collection_details(
@@ -166,8 +181,23 @@ class CollectionFeedGenerator(BaseFeedGenerator):
                     token=token
             )
 
+            # Honor the global pagination config, exactly like the library items feed
+            if not PAGINATION_ENABLED:
+                items_per_page = 0
+            else:
+                items_per_page = ITEMS_PER_PAGE
+            no_pagination = (items_per_page <= 0)
+
+            # Current page calculation (1-based)
+            page = 1 if no_pagination else ((start_index - 1) // items_per_page) + 1
+
+            # Path used for the self/alternate links and the pagination links
+            current_path = f"{username}/libraries/{library_id}/collections/{collection_id}"
+            current_path_with_page = (current_path if no_pagination
+                                      else f"{current_path}?start_index={start_index}")
+
             # Create the feed
-            feed = self.create_base_feed(username, library_id, token=token)
+            feed = self.create_base_feed(username, library_id, current_path_with_page, token)
 
             # Build the feed metadata
             feed_data = {
@@ -188,41 +218,20 @@ class CollectionFeedGenerator(BaseFeedGenerator):
                 dict_to_xml(feed, error_data)
                 return self.create_response(feed)
 
-            # Check if pagination is enabled
-            if not PAGINATION_ENABLED:
-                # Pagination is disabled, show all items
-                per_page = 0
-                no_pagination = True
-            else:
-                # Use items per page from config if not specified
-                per_page = ITEMS_PER_PAGE if per_page is None else per_page
-                # If per_page is 0, we'll show all items without pagination
-                no_pagination = (per_page <= 0)
+            # Get total count before pagination
+            total_books = len(collection_items)
 
             # Apply pagination
-            total_books = len(collection_items)
-            total_pages = 1 if no_pagination else (total_books + per_page - 1) // per_page  # Ceiling division
-
-            # Adjust page number if out of bounds
-            if page < 1:
-                page = 1
-            elif page > total_pages and total_pages > 0:
-                page = total_pages
-
             if no_pagination:
-                # No pagination, show all items
                 paged_items = collection_items
             else:
-                # Calculate start and end indices
-                start_idx = (page - 1) * per_page
-                end_idx = min(start_idx + per_page, total_books)
+                paged_items = self.paginate_results(collection_items, start_index, items_per_page)
 
-                # Get the subset of books for this page
-                paged_items = collection_items[start_idx:end_idx]
-
-            # Add pagination links only if pagination is enabled
+            # Add pagination metadata and links
             if not no_pagination:
-                self._add_pagination_links(feed, username, library_id, collection_id, page, total_pages, token)
+                self.add_pagination_metadata(feed, page, items_per_page, total_books)
+                self.add_pagination_links(feed, current_path.rstrip('&?'),
+                                          page, items_per_page, total_books, token=token)
 
             # Get ebook files in optimal batch sizes to avoid overwhelming the server
             BATCH_SIZE = 5  # Adjust based on server capacity
@@ -253,70 +262,6 @@ class CollectionFeedGenerator(BaseFeedGenerator):
 
             # Use handle_exception to return a standardized error response
             return handle_exception(e, context=context)
-
-    def _add_pagination_links(self, feed, username, library_id, collection_id,
-                              current_page, total_pages, token=None):
-        """Add pagination links to the feed.
-
-        Args:
-            feed: The XML feed object to add links to
-            username: The username for URLs
-            library_id: The library ID for URLs
-            collection_id: The collection ID for URLs
-            current_page: Current page number
-            total_pages: Total number of pages
-            token: Optional token to include in URLs
-        """
-        # Base URL for pagination
-        base_url = f"/opds/{username}/libraries/{library_id}/collections/{collection_id}"
-        token_param = f"&token={token}" if token else ""
-
-        # Add pagination links
-        links = []
-
-        # First page link
-        if current_page > 1:
-            links.append({
-                "_attrs": {
-                    "rel": "first",
-                    "href": f"{base_url}?page=1{token_param}",
-                    "type": "application/atom+xml;profile=opds-catalog"
-                }
-            })
-
-        # Previous page link
-        if current_page > 1:
-            links.append({
-                "_attrs": {
-                    "rel": "previous",
-                    "href": f"{base_url}?page={current_page-1}{token_param}",
-                    "type": "application/atom+xml;profile=opds-catalog"
-                }
-            })
-
-        # Next page link
-        if current_page < total_pages:
-            links.append({
-                "_attrs": {
-                    "rel": "next",
-                    "href": f"{base_url}?page={current_page+1}{token_param}",
-                    "type": "application/atom+xml;profile=opds-catalog"
-                }
-            })
-
-        # Last page link
-        if current_page < total_pages:
-            links.append({
-                "_attrs": {
-                    "rel": "last",
-                    "href": f"{base_url}?page={total_pages}{token_param}",
-                    "type": "application/atom+xml;profile=opds-catalog"
-                }
-            })
-
-        # Add links to feed
-        for link in links:
-            dict_to_xml(feed, {"link": link})
 
     def add_collection_to_feed(self, username, library_id, feed, collection, token=None):
         """Add a collection to the feed.

@@ -789,6 +789,7 @@ async def opds_collection_items(
     username: str,
     library_id: str,
     collection_id: str,
+    request: Request,
     auth_info: tuple = Depends(get_authenticated_user)
 ):
     """Get items from a specific collection using cached data when possible.
@@ -797,17 +798,28 @@ async def opds_collection_items(
         username (str): The username path parameter.
         library_id (str): ID of the library to get items from.
         collection_id (str): ID of the collection to filter by.
+        request (Request): The incoming request object containing pagination parameters.
         auth_info (tuple): The authentication info (username, token, display_name).
 
     Returns:
         Response: The items feed for books in the specified collection.
+
+    Query Parameters:
+        start_index (int): Starting index for pagination (1-based).
     """
     try:
         auth_username, token, display_name = auth_info
 
         # Ensure this is the authenticated user's feed or authentication is disabled
         if AUTH_ENABLED and auth_username and username != display_name:
-            return RedirectResponse(url=f"/opds/{display_name}/libraries/{library_id}/collections/{collection_id}")
+            # Preserve query parameters in the redirect
+            params_str = "&".join([f"{k}={v}" for k, v in request.query_params.items()])
+            redirect_url = (
+                f"/opds/{display_name}/libraries/{library_id}/collections/{collection_id}"
+            )
+            if params_str:
+                redirect_url += f"?{params_str}"
+            return RedirectResponse(url=redirect_url)
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -816,7 +828,8 @@ async def opds_collection_items(
             effective_username,
             library_id,
             collection_id,
-            token=token
+            token=token,
+            params=dict(request.query_params)
         )
     except ResourceNotFoundError as e:
         # ResourceNotFoundError is already properly handled in the feed generator
@@ -831,6 +844,7 @@ async def opds_collection_items(
 async def opds_authors(
     username: str,
     library_id: str,
+    request: Request,
     auth_info: tuple = Depends(get_authenticated_user)
 ):
     """Get authors from a specific library.
@@ -838,17 +852,26 @@ async def opds_authors(
     Args:
         username (str): The username path parameter.
         library_id (str): ID of the library to get authors from.
+        request (Request): The incoming request object containing pagination parameters.
         auth_info (tuple): The authentication info (username, token, display_name).
 
     Returns:
         Response: The authors feed for the specified library.
+
+    Query Parameters:
+        start_index (int): Starting index for pagination (1-based).
     """
     try:
         auth_username, token, display_name = auth_info
 
         # Ensure this is the authenticated user's feed or authentication is disabled
         if AUTH_ENABLED and auth_username and username != display_name:
-            return RedirectResponse(url=f"/opds/{display_name}/libraries/{library_id}/authors")
+            # Preserve query parameters in the redirect
+            params_str = "&".join([f"{k}={v}" for k, v in request.query_params.items()])
+            redirect_url = f"/opds/{display_name}/libraries/{library_id}/authors"
+            if params_str:
+                redirect_url += f"?{params_str}"
+            return RedirectResponse(url=redirect_url)
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -856,7 +879,8 @@ async def opds_authors(
         return await author_feed.generate_authors_feed(
             effective_username,
             library_id,
-            token=token
+            token=token,
+            params=dict(request.query_params)
         )
     except ResourceNotFoundError as e:
         # ResourceNotFoundError is already properly handled in the feed generator
@@ -872,6 +896,7 @@ async def opds_author_items(
     username: str,
     library_id: str,
     author_id: str,
+    request: Request,
     auth_info: tuple = Depends(get_authenticated_user)
 ):
     """Get items from a specific author using cached data when possible.
@@ -880,17 +905,26 @@ async def opds_author_items(
         username (str): The username path parameter.
         library_id (str): ID of the library to get items from.
         author_id (str): ID of the author to filter by.
+        request (Request): The incoming request object containing pagination parameters.
         auth_info (tuple): The authentication info (username, token, display_name).
 
     Returns:
         Response: The items feed for books by the specified author.
+
+    Query Parameters:
+        start_index (int): Starting index for pagination (1-based).
     """
     try:
         auth_username, token, display_name = auth_info
 
         # Ensure this is the authenticated user's feed or authentication is disabled
         if AUTH_ENABLED and auth_username and username != display_name:
-            return RedirectResponse(url=f"/opds/{display_name}/libraries/{library_id}/authors/{author_id}")
+            # Preserve query parameters in the redirect
+            params_str = "&".join([f"{k}={v}" for k, v in request.query_params.items()])
+            redirect_url = f"/opds/{display_name}/libraries/{library_id}/authors/{author_id}"
+            if params_str:
+                redirect_url += f"?{params_str}"
+            return RedirectResponse(url=redirect_url)
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -899,7 +933,8 @@ async def opds_author_items(
             effective_username,
             library_id,
             author_id,
-            token=token
+            token=token,
+            params=dict(request.query_params)
         )
     except ResourceNotFoundError as e:
         # ResourceNotFoundError is already properly handled in the feed generator
