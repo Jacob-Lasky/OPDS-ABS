@@ -132,7 +132,12 @@ class AccessLogMiddleware:
             path = scope.get("path", "") + (f"?{query}" if query else "")
             forwarded = _header(scope, b"x-forwarded-for").split(",")[0].strip()
             client = forwarded or (scope.get("client") or ("-",))[0]
-            level = logging.WARNING if status >= 500 else logging.INFO
+            if status >= 500:
+                level = logging.WARNING
+            elif scope.get("path") == "/healthz":
+                level = logging.DEBUG  # the container HEALTHCHECK polls this every minute
+            else:
+                level = logging.INFO
             access_logger.log(
                 level,
                 '%s %s -> %d %dB %.0fms user=%s auth=%s ip=%s ua="%s"',

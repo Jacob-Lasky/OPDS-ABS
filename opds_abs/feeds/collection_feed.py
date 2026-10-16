@@ -6,14 +6,15 @@ import asyncio
 # Local application imports
 from opds_abs.core.feed_generator import BaseFeedGenerator
 from opds_abs.api.client import fetch_from_api, get_download_urls_from_item
-from opds_abs.config import AUDIOBOOKSHELF_API, ITEMS_PER_PAGE, PAGINATION_ENABLED
+from opds_abs.config import AUDIOBOOKSHELF_EXTERNAL_API, ITEMS_PER_PAGE, PAGINATION_ENABLED
 from opds_abs.utils import dict_to_xml
 from opds_abs.utils.cache_utils import get_cached_library_items
 from opds_abs.utils.error_utils import (
+    AuthenticationError,
     FeedGenerationError,
     ResourceNotFoundError,
+    OPDSBaseException,
     log_error,
-    handle_exception
 )
 
 # Set up logging
@@ -31,105 +32,37 @@ class CollectionFeedGenerator(BaseFeedGenerator):
     """
 
     async def get_collection_details(self, username, collection_id, token=None):
-        """Fetch detailed information about a specific collection.
+        """Fetch a collection from Audiobookshelf.
 
-        Args:
-            username (str): The username of the authenticated user.
-            collection_id (str): ID of the collection to get details for.
-            token (str, optional): Authentication token for Audiobookshelf.
-
-        Returns:
-            dict: Collection details or None if not found.
+        Raises:
+            ResourceNotFoundError: The collection does not exist.
         """
-        try:
-            # Get the collection data
-            collection_data = await fetch_from_api(
-                    f"/collections/{collection_id}",
-                    username=username,
-                    token=token
-            )
-            return collection_data
-        except Exception as e:
-            logger.error("Error fetching collection details: %s", e)
-            return None
+        return await fetch_from_api(f"/collections/{collection_id}", username=username, token=token)
 
     async def filter_items_by_collection_id(self, username, library_id, collection_id, token=None):
-        """Filter items by collection ID using cached items when possible.
+        """Return the library's ebook items that belong to a collection.
 
-        Args:
-            username (str): The username of the authenticated user.
-            library_id (str): ID of the library containing the items.
-            collection_id (str): ID of the collection to filter by.
-            token (str, optional): Authentication token for Audiobookshelf.
+        Uses the cached all-items list, so collection pages need one collection
+        fetch rather than one item fetch per book.
 
-        Returns:
-            list: Library items filtered by the specified collection ID.
+        DO NOT add a fallback to ``/libraries/{id}/items?collection=``: ABS has no
+        such filter and ignores it, so the "fallback" listed the whole library
+        under the collection's name. Errors propagate and become an error
+        response instead.
         """
-        try:
-            # Get collection details to get the books in this collection
-            collection_details = await self.get_collection_details(
-                    username,
-                    collection_id,
-                    token=token
-            )
+        collection_details = await self.get_collection_details(username, collection_id, token=token)
+        collection_book_ids = {
+            book.get("id") for book in collection_details.get("books", []) if book.get("id")
+        }
+        if not collection_book_ids:
+            return []
 
-            # If we can't get collection details, fall back to API call
-            if not collection_details:
-                logger.warning("Could not find collection details for ID %s", collection_id)
-                params = {"collection": collection_id}
-                data = await fetch_from_api(
-                        f"/libraries/{library_id}/items",
-                        params,
-                        username=username,
-                        token=token
-                )
-                return self.filter_items(data)
-
-            collection_name = collection_details.get("name", "Unknown Collection")
-            logger.debug("Filtering items by collection: %s", collection_name)
-
-            # Get the book IDs in this collection - use a set for O(1) lookup
-            collection_book_ids = {
-                book.get("id") for book in collection_details.get("books", [])
-                if book.get("id")
-            }
-
-            if not collection_book_ids:
-                logger.warning("No book IDs found in collection %s", collection_id)
-                return []
-
-            # Try to get all library items from cache using the shared utility function
-            library_items = await get_cached_library_items(
-                fetch_from_api,
-                self.filter_items,
-                username,
-                library_id,
-                token=token
-            )
-
-            # Filter the cached items by matching book IDs - using list comprehension for efficiency
-            filtered_items = [
-                item for item in library_items
-                if item.get("id") in collection_book_ids
-            ]
-
-            logger.debug("Found %d items in collection %s from cache",
-                        len(filtered_items),
-                        collection_name
-            )
-            return filtered_items
-
-        except Exception as e:
-            logger.error("Error filtering items by collection: %s", e)
-            # Fall back to API call if there was an error
-            params = {"collection": collection_id}
-            data = await fetch_from_api(
-                    f"/libraries/{library_id}/items",
-                    params,
-                    username=username,
-                    token=token
-            )
-            return self.filter_items(data)
+        library_items = await get_cached_library_items(
+            fetch_from_api, self.filter_items, username, library_id, token=token)
+        filtered_items = [item for item in library_items if item.get("id") in collection_book_ids]
+        logger.debug("Collection %s: %d of %d books have ebooks",
+                     collection_details.get("name"), len(filtered_items), len(collection_book_ids))
+        return filtered_items
 
     async def generate_collection_items_feed(self, username, library_id, collection_id, token=None,
                                              params=None):
@@ -255,13 +188,10 @@ class CollectionFeedGenerator(BaseFeedGenerator):
 
             return self.create_response(feed)
 
+        except OPDSBaseException:
+            raise
         except Exception as e:
-            # Handle any unexpected errors
-            context = f"Generating collection items feed for collection {collection_id}"
-            log_error(e, context=context)
-
-            # Use handle_exception to return a standardized error response
-            return handle_exception(e, context=context)
+            raise FeedGenerationError(f"Generating collection items feed for collection {collection_id}" + f": {e}") from e
 
     def add_collection_to_feed(self, username, library_id, feed, collection, token=None):
         """Add a collection to the feed.
@@ -297,7 +227,7 @@ class CollectionFeedGenerator(BaseFeedGenerator):
                 for book in books_with_ebooks:
                     book_id = book.get("id")
                     if book_id:
-                        book_path = f"{AUDIOBOOKSHELF_API}/items/{book_id}"
+                        book_path = f"{AUDIOBOOKSHELF_EXTERNAL_API}/items/{book_id}"
                         cover_url = f"{book_path}/cover?format=jpeg"
                         break
 
@@ -322,7 +252,7 @@ class CollectionFeedGenerator(BaseFeedGenerator):
                             "_attrs": {
                                 "href": cover_url,
                                 "rel": "http://opds-spec.org/image",
-                                "type": "image/jpeg"
+                                "type": self.image_type(cover_url)
                             }
                         }
                     ]
@@ -375,32 +305,22 @@ class CollectionFeedGenerator(BaseFeedGenerator):
             filtered_collections = []
             collection_errors = []
 
-            for collection in collections:
-                # We need to fetch each collection's books separately
-                collection_id = collection.get("id", "")
-                if collection_id:
-                    try:
-                        collection_data = await fetch_from_api(f"/collections/{collection_id}", username=username, token=token)
-
-                        # Check if there are ebooks in this collection and count them
-                        ebook_count = 0
-                        for book in collection_data.get("books", []):
-                            media = book.get("media", {})
-                            if (media.get("ebookFile") is not None or
-                                (media.get("ebookFormat") is not None and media.get("ebookFormat"))):
-                                ebook_count += 1
-
-                        if ebook_count > 0:
-                            logger.debug("Collection \"%s\" has %d ebooks", collection_data.get('name'), ebook_count)
-                            filtered_collections.append(collection_data)
-                    except ResourceNotFoundError as e:
-                        context = f"Fetching collection {collection_id}"
-                        log_error(e, context=context, log_traceback=False)
-                        collection_errors.append(f"Collection {collection.get('name', collection_id)}: {str(e)}")
-                    except Exception as e:
-                        context = f"Fetching collection {collection_id}"
-                        log_error(e, context=context)
-                        collection_errors.append(f"Collection {collection.get('name', collection_id)}: {str(e)}")
+            # Fetch every collection's books concurrently (was one at a time).
+            ids = [c.get("id") for c in collections if c.get("id")]
+            results = await asyncio.gather(
+                *(fetch_from_api(f"/collections/{cid}", username=username, token=token) for cid in ids),
+                return_exceptions=True)
+            for collection_id, collection_data in zip(ids, results):
+                if isinstance(collection_data, AuthenticationError):
+                    raise collection_data
+                if isinstance(collection_data, Exception):
+                    logger.warning("Skipping collection %s: %s", collection_id, collection_data)
+                    collection_errors.append(f"Collection {collection_id}: {collection_data}")
+                    continue
+                ebook_count = sum(1 for book in collection_data.get("books", [])
+                                  if self._book_has_ebook(book))
+                if ebook_count:
+                    filtered_collections.append(collection_data)
 
             # Sort collections by name
             filtered_collections = sorted(filtered_collections, key=lambda x: x.get("name", "").lower())
@@ -436,13 +356,15 @@ class CollectionFeedGenerator(BaseFeedGenerator):
             }
             dict_to_xml(feed, error_data)
             return self.create_response(feed)
+        except OPDSBaseException:
+            raise
         except Exception as e:
-            # Handle any other unexpected errors
-            context = f"Generating collections feed for user {username}, library {library_id}"
-            log_error(e, context=context)
+            raise FeedGenerationError(f"Generating collections feed for user {username}, library {library_id}" + f": {e}") from e
 
-            # Use handle_exception to return a standardized error response
-            return handle_exception(e, context=context)
+    @staticmethod
+    def _book_has_ebook(book):
+        media = book.get("media", {})
+        return media.get("ebookFile") is not None or bool(media.get("ebookFormat"))
 
     async def get_collections(self, username, library_id, token=None):
         """Fetch all collections available in a library.
@@ -471,7 +393,7 @@ class CollectionFeedGenerator(BaseFeedGenerator):
             collections = collections_data.get("results", [])
 
             if not collections:
-                logger.warning("No collections found in library %s", library_id)
+                logger.info("No collections in library %s", library_id)
             else:
                 logger.debug("Found %d collections in library %s", len(collections), library_id)
 

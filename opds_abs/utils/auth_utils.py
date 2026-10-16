@@ -70,30 +70,30 @@ class Credentials:
         return hashlib.sha256(raw).hexdigest()
 
 
-# cache_key -> (token, abs_username, expires_at)
-_TOKEN_CACHE: Dict[str, Tuple[str, str, float]] = {}
+# cache_key -> (token, abs_username, abs_user_type, expires_at)
+_TOKEN_CACHE: Dict[str, Tuple[str, str, str, float]] = {}
 
 
 class AbsUnavailableError(AuthenticationError):
     """Audiobookshelf could not be reached while checking credentials."""
 
 
-def _cache_get(creds: Credentials) -> Optional[Tuple[str, str]]:
+def _cache_get(creds: Credentials) -> Optional[Tuple[str, str, str]]:
     if not AUTH_TOKEN_CACHING:
         return None
     entry = _TOKEN_CACHE.get(creds.cache_key())
     if entry is None:
         return None
-    token, abs_username, expires_at = entry
+    *identity, expires_at = entry
     if time.monotonic() >= expires_at:
         _TOKEN_CACHE.pop(creds.cache_key(), None)
         return None
-    return token, abs_username
+    return tuple(identity)
 
 
-def _cache_put(creds: Credentials, token: str, abs_username: str) -> None:
+def _cache_put(creds: Credentials, identity: Tuple[str, str, str]) -> None:
     if AUTH_TOKEN_CACHING:
-        _TOKEN_CACHE[creds.cache_key()] = (token, abs_username, time.monotonic() + AUTH_CACHE_EXPIRY)
+        _TOKEN_CACHE[creds.cache_key()] = (*identity, time.monotonic() + AUTH_CACHE_EXPIRY)
 
 
 def invalidate_token(token: str) -> None:
@@ -141,8 +141,8 @@ def get_credentials_from_request(request: Request) -> Optional[Credentials]:
     return None
 
 
-async def _abs_login(session: aiohttp.ClientSession, username: str, password: str) -> Optional[Tuple[str, str]]:
-    """Password login. Returns (token, abs_username), or None if ABS rejects it."""
+async def _abs_login(session: aiohttp.ClientSession, username: str, password: str) -> Optional[Tuple[str, str, str]]:
+    """Password login. Returns (token, abs_username, user_type), or None if ABS rejects it."""
     async with session.post(
         f"{AUDIOBOOKSHELF_INTERNAL_URL}/login",
         json={"username": username, "password": password},
@@ -157,11 +157,11 @@ async def _abs_login(session: aiohttp.ClientSession, username: str, password: st
     token = user.get("token") or user.get("accessToken")
     if not token:
         raise AuthenticationError("Audiobookshelf /login response contained no token")
-    return token, user.get("username") or username
+    return token, user.get("username") or username, user.get("type") or "user"
 
 
-async def _abs_authorize_api_key(session: aiohttp.ClientSession, api_key: str) -> Optional[Tuple[str, str]]:
-    """API key check. Returns (api_key, abs_username), or None if ABS rejects it.
+async def _abs_authorize_api_key(session: aiohttp.ClientSession, api_key: str) -> Optional[Tuple[str, str, str]]:
+    """API key check. Returns (api_key, abs_username, user_type), or None if ABS rejects it.
 
     ABS API keys are used as Bearer tokens. ``POST /api/authorize`` returns
     ``{"user": {...}}``; ABS has no X-Api-Key header.
@@ -177,11 +177,11 @@ async def _abs_authorize_api_key(session: aiohttp.ClientSession, api_key: str) -
         user = (await response.json()).get("user") or {}
     if not user.get("username"):
         raise AuthenticationError("Audiobookshelf /api/authorize response contained no user")
-    return api_key, user["username"]
+    return api_key, user["username"], user.get("type") or "user"
 
 
-async def authenticate(creds: Credentials) -> Tuple[str, str, str]:
-    """Resolve credentials to (abs_username, token, method).
+async def authenticate(creds: Credentials) -> Tuple[str, str, str, str]:
+    """Resolve credentials to (abs_username, token, user_type, method).
 
     ``method`` is ``cache``, ``password`` or ``apikey`` and exists for logging.
 
@@ -191,8 +191,8 @@ async def authenticate(creds: Credentials) -> Tuple[str, str, str]:
     """
     cached = _cache_get(creds)
     if cached:
-        token, abs_username = cached
-        return abs_username, token, "cache"
+        token, abs_username, user_type = cached
+        return abs_username, token, user_type, "cache"
 
     try:
         async with aiohttp.ClientSession(timeout=_ABS_TIMEOUT) as session:
@@ -215,9 +215,9 @@ async def authenticate(creds: Credentials) -> Tuple[str, str, str]:
 
     if result is None:
         raise AuthenticationError("Invalid credentials")
-    token, abs_username = result
-    _cache_put(creds, token, abs_username)
-    return abs_username, token, method
+    _cache_put(creds, result)
+    token, abs_username, user_type = result
+    return abs_username, token, user_type, method
 
 
 def _challenge(detail: str) -> HTTPException:
@@ -246,7 +246,7 @@ async def get_authenticated_user(request: Request) -> Tuple[Optional[str], Optio
 
     request.state.auth_user = creds.username
     try:
-        username, token, method = await authenticate(creds)
+        username, token, user_type, method = await authenticate(creds)
     except AbsUnavailableError as e:
         request.state.auth_method = "abs-unavailable"
         logger.error("Auth check failed for %r: %s", creds.username, e)
@@ -258,8 +258,21 @@ async def get_authenticated_user(request: Request) -> Tuple[Optional[str], Optio
 
     request.state.auth_user = username
     request.state.auth_method = method
+    request.state.abs_user_type = user_type
     return username, token, username
 
 
-# Kept as an alias: every protected route needs the same guarantee now.
-require_auth = get_authenticated_user
+ADMIN_USER_TYPES = frozenset({"root", "admin"})
+
+
+async def require_admin(request: Request) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """FastAPI dependency: an authenticated ABS root or admin user.
+
+    The /admin endpoints clear and inspect every user's cache; any ABS account
+    could call them before. With auth disabled there is no way to tell, so
+    they are refused.
+    """
+    auth_info = await get_authenticated_user(request)
+    if getattr(request.state, "abs_user_type", None) not in ADMIN_USER_TYPES:
+        raise HTTPException(status_code=403, detail="Audiobookshelf admin required")
+    return auth_info

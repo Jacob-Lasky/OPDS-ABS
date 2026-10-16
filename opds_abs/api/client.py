@@ -11,7 +11,6 @@ import aiohttp
 from opds_abs.config import (
     AUDIOBOOKSHELF_API,
     AUDIOBOOKSHELF_INTERNAL_URL,
-    AUDIOBOOKSHELF_EXTERNAL_URL,
     AUTH_ENABLED,
     AUTHORS_CACHE_EXPIRY,
     COLLECTIONS_CACHE_EXPIRY,
@@ -21,8 +20,8 @@ from opds_abs.config import (
     SEARCH_RESULTS_CACHE_EXPIRY,
     SERIES_DETAILS_CACHE_EXPIRY
 )
-from opds_abs.utils.cache_utils import _create_cache_key, cache_get, cache_set, cached, _cache
-from opds_abs.utils.error_utils import AuthenticationError, APIClientError, log_error
+from opds_abs.utils.cache_utils import _create_cache_key, cache_get, cache_set, _cache
+from opds_abs.utils.error_utils import AuthenticationError, APIClientError, ResourceNotFoundError, log_error
 from opds_abs.utils.auth_utils import invalidate_token
 
 logger = logging.getLogger(__name__)
@@ -81,7 +80,7 @@ async def fetch_from_api(
         headers["Authorization"] = auth_header
         logger.debug("Using Bearer token authentication for API call to %s", endpoint)
     else:
-        logger.warning("No token for API call to %s", endpoint)
+        logger.debug("No token for API call to %s (auth disabled)", endpoint)
 
     # Determine the cache expiry time based on the endpoint
     cache_expiry = DEFAULT_CACHE_EXPIRY
@@ -105,8 +104,9 @@ async def fetch_from_api(
     logger.debug("📡 Fetching: %s%s", url, ' with params ' + str(params) if params else '')
 
     try:
-        # Use a shorter timeout for faster failure detection when server is down
-        timeout = aiohttp.ClientTimeout(total=5)
+        # Connect fails fast when ABS is down; the read allows for the all-items
+        # fetch of a large library, which a 5s total timeout used to cut off.
+        timeout = aiohttp.ClientTimeout(total=60, sock_connect=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.get(
@@ -121,14 +121,12 @@ async def fetch_from_api(
                     cache_set(cache_key, data)
                     return data
             except asyncio.TimeoutError as timeout_error:
-                context = f"API call to {url}"
                 logger.error("Timeout connecting to Audiobookshelf API at %s", url)
                 raise APIClientError(
-                    f"Audiobookshelf server is not responding. Please ensure it's running and accessible."
+                    "Audiobookshelf server is not responding. Please ensure it's running and accessible."
                 ) from timeout_error
             except aiohttp.ClientResponseError as resp_error:
-                context = f"API call to {url}"
-                log_error(resp_error, context=context)
+                logger.warning("Audiobookshelf returned HTTP %d for %s", resp_error.status, endpoint)
 
                 # Check if this might be an authentication error
                 if resp_error.status in (401, 403):
@@ -142,6 +140,9 @@ async def fetch_from_api(
                     raise AuthenticationError(
                         f"Authentication failed for Audiobookshelf API: {str(resp_error)}"
                     ) from resp_error
+
+                if resp_error.status == 404:
+                    raise ResourceNotFoundError(f"Not found in Audiobookshelf: {endpoint}") from resp_error
 
                 # For other response errors, provide a clearer message
                 error_msg = f"Audiobookshelf API error (status {resp_error.status}): {str(resp_error)}"
@@ -169,14 +170,14 @@ async def fetch_from_api(
         raise APIClientError(
             f"Cannot connect to Audiobookshelf server at {host_info}. Please ensure it's running and accessible."
         ) from None  # Use "from None" to suppress the traceback in the logs
+    except (AuthenticationError, ResourceNotFoundError, APIClientError):
+        raise  # already classified above; DO NOT let the catch-all turn a 401/404 into a 503
     except Exception as e:
-        context = f"API call to {url}"
-        log_error(e, context=context)
+        log_error(e, context=f"API call to {url}")
         raise APIClientError(
             f"Error communicating with Audiobookshelf API: {str(e)}"
         ) from e
 
-@cached(expiry=LIBRARY_ITEMS_CACHE_EXPIRY)
 async def get_download_urls_from_item(
     item_id: str,
     username: str = None,
@@ -198,11 +199,12 @@ async def get_download_urls_from_item(
             - ino: The inode number of the file
             - filename: The filename of the ebook
             - download_url: An empty string (filled in later)
+
+    Not wrapped in @cached: fetch_from_api already caches successful responses,
+    and a cache around this function also stored the [] it returns on error, which
+    hid the book from every feed for 30 minutes after one upstream hiccup.
     """
     try:
-        # Log authentication information for debugging
-        logger.debug("Getting download URLs for item %s, username: %s, token present: %s", item_id, username, token is not None)
-
         item = await fetch_from_api(f"/items/{item_id}", username=username, token=token)
         ebook_inos = []
         for file in item.get("libraryFiles", []):
@@ -217,8 +219,10 @@ async def get_download_urls_from_item(
 
         logger.debug("Found %d ebook files for item %s", len(ebook_inos), item_id)
         return ebook_inos
+    except AuthenticationError:
+        raise
     except Exception as e:
-        log_error(e, context="Getting download URLs for item %s" % item_id)
+        logger.warning("Could not list ebook files for item %s, omitting it from this feed: %s", item_id, e)
         return []
 
 def invalidate_cache(endpoint: str = None, params: dict = None, username: str = None):

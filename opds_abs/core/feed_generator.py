@@ -10,7 +10,7 @@ from lxml import etree
 from fastapi.responses import Response
 
 # Local application imports
-from opds_abs.config import AUDIOBOOKSHELF_API
+from opds_abs.config import AUDIOBOOKSHELF_EXTERNAL_API
 from opds_abs.utils import dict_to_xml
 from opds_abs.utils.error_utils import FeedGenerationError, log_error
 
@@ -162,7 +162,7 @@ class BaseFeedGenerator:
                     xml_declaration=False,
                     encoding="UTF-8"
             )
-            return Response(content=feed_xml, media_type="application/atom+xml")
+            return Response(content=feed_xml, media_type="application/atom+xml;profile=opds-catalog")
         except Exception as e:
             log_error(e, context="Creating XML response")
             raise FeedGenerationError("Failed to generate XML response") from e
@@ -202,9 +202,7 @@ class BaseFeedGenerator:
             logger.debug("Book '%s' format: %s", book_title, ebook_format)
 
             for ebook in ebook_inos:
-                # Use external URL for client-facing download links
-                from opds_abs.config import AUDIOBOOKSHELF_EXTERNAL_URL
-                book_path = f"{AUDIOBOOKSHELF_EXTERNAL_URL}/api/items/{book_id}"
+                book_path = f"{AUDIOBOOKSHELF_EXTERNAL_API}/items/{book_id}"
                 file_ino = ebook.get('ino')
 
                 # Use our proxy endpoint instead of direct Audiobookshelf API link
@@ -338,51 +336,6 @@ class BaseFeedGenerator:
             log_error(e, context="Filtering items for ebooks")
             raise FeedGenerationError(f"Error filtering items: {str(e)}") from e
 
-    def sort_results(self, data):
-        """Sort results based on the opds_seq field.
-
-        Args:
-            data (list): List of items to sort.
-
-        Returns:
-            list: Sorted list of items.
-
-        Raises:
-            FeedGenerationError: If there's an error sorting the results.
-        """
-        try:
-            sorted_results = sorted(
-                    data,
-                    key=lambda x: x["opds_seq"],
-                    reverse=False
-                )
-            return sorted_results
-        except Exception as e:
-            log_error(e, context="Sorting results")
-            raise FeedGenerationError(f"Error sorting results: {str(e)}") from e
-
-    def extract_value(self, item, path):
-        """Extract value from a nested dictionary using a dot-separated path.
-
-        Args:
-            item (dict): The dictionary to extract values from.
-            path (str): Dot-separated path indicating where to find the value.
-
-        Returns:
-            any: The extracted value, or None if the path doesn't exist.
-        """
-        try:
-            keys = path.split('.')
-            for key in keys:
-                item = item.get(key, None)
-                if item is None:
-                    break
-            return item
-        except Exception as e:
-            # Just log here but don't raise as this is a utility function
-            log_error(e, context=f"Extracting value from path {path}")
-            return None
-
     def add_pagination_metadata(self, feed, page, items_per_page, total_items):
         """Add OpenSearch pagination metadata elements to the feed.
 
@@ -497,6 +450,11 @@ class BaseFeedGenerator:
             str: Current timestamp in ISO 8601 format (e.g. 2025-04-21T12:34:56Z)
         """
         return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    @staticmethod
+    def image_type(url):
+        """MIME type for an image link: our placeholders are PNG, ABS serves JPEG."""
+        return "image/png" if url.split("?", 1)[0].endswith(".png") else "image/jpeg"
 
     def format_timestamp(self, epoch_ms=None):
         """Format an ABS epoch-milliseconds timestamp as Atom ``updated``.

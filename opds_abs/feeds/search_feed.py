@@ -1,5 +1,6 @@
 """Search feed generator."""
 # Standard library imports
+import asyncio
 import logging
 from collections import defaultdict
 
@@ -7,7 +8,6 @@ from collections import defaultdict
 # Local application imports
 from opds_abs.core.feed_generator import BaseFeedGenerator
 from opds_abs.api.client import fetch_from_api, get_download_urls_from_item
-from opds_abs.config import ITEMS_PER_PAGE, PAGINATION_ENABLED
 from opds_abs.feeds.author_feed import AuthorFeedGenerator
 from opds_abs.feeds.series_feed import SeriesFeedGenerator
 from opds_abs.utils import dict_to_xml
@@ -70,42 +70,6 @@ class SearchFeedGenerator(BaseFeedGenerator):
 
         Returns:
             Response: The search results feed containing matching books, series, and authors.
-
-        Example:
-            ```python
-            # In a FastAPI route handler:
-            @app.get("/opds/{username}/libraries/{library_id}/search")
-            async def opds_search(
-                username: str,
-                library_id: str,
-                request: Request,
-                auth_info: tuple = Depends(get_authenticated_user)
-            ):
-                try:
-                    auth_username, token, display_name = auth_info
-
-                    # Get query parameters from the request
-                    params = dict(request.query_params)
-
-                    # Use appropriate username based on authentication
-                    effective_username = display_name if auth_username else username
-
-                    # Initialize the search feed generator
-                    search_feed = SearchFeedGenerator()
-
-                    # Generate and return the search results feed
-                    return await search_feed.generate_search_feed(
-                        effective_username,
-                        library_id,
-                        params,
-                        token=token
-                    )
-                except Exception as e:
-                    # Handle exceptions appropriately
-                    context = f"Searching in library {library_id} for user {username}"
-                    log_error(e, context=context)
-                    return handle_exception(e, context=context)
-            ```
         """
         params = params or {}
         query = params.get("q", "")
@@ -201,42 +165,24 @@ class SearchFeedGenerator(BaseFeedGenerator):
         # Create a mapping of book IDs to their full library item data
         book_id_map = {item.get('id'): item for item in cached_library_items if item.get('id')}
 
-        for book_result in book_results:
-            await self._process_single_book(feed, book_result, username, book_id_map, token)
+        books = [self._resolve_book(r, book_id_map) for r in book_results]
+        books = [b for b in books if b]
+        # Fetch every hit's ebook files concurrently; entries keep ABS's ranking.
+        ebook_inos_list = await asyncio.gather(
+            *(get_download_urls_from_item(b["id"], username=username, token=token) for b in books))
+        for lib_item, ebook_inos in zip(books, ebook_inos_list):
+            self.add_book_to_feed(feed, lib_item, ebook_inos, "", token=token)
 
-    async def _process_single_book(self, feed, book_result, username, book_id_map, token=None):
-        """Process a single book and add it to the feed if it has an ebook.
+    def _resolve_book(self, book_result, book_id_map):
+        """Return the full library item for a search hit, or None if it has no ebook.
 
-        Args:
-            feed: The XML feed object to add the book entry to.
-            book_result: Dictionary containing the book search result data.
-            username: String representing the authenticated user's username.
-            book_id_map: Dictionary mapping book IDs to their complete metadata.
-            token: Optional authentication token for Audiobookshelf.
-
-        Returns:
-            None. The book is added directly to the feed if it meets criteria.
-
-        Note:
-            Books without ebook files are skipped.
+        Prefers the cached all-items entry, which carries complete metadata.
         """
-        if "libraryItem" not in book_result:
-            return
-
-        lib_item = book_result.get("libraryItem", {})
+        lib_item = book_result.get("libraryItem") or {}
         book_id = lib_item.get("id")
-
         if not book_id or not self._has_ebook_file(lib_item):
-            return
-
-        # Look up the book in our cache for complete metadata
-        cached_item = book_id_map.get(book_id)
-        if cached_item:
-            # Use the cached item which has complete metadata including author information
-            lib_item = cached_item
-
-        ebook_inos = await get_download_urls_from_item(book_id, username=username, token=token)
-        self.add_book_to_feed(feed, lib_item, ebook_inos, "", token=token)
+            return None
+        return book_id_map.get(book_id) or lib_item
 
     def _has_ebook_file(self, lib_item):
         """Check if a library item has an ebook file.

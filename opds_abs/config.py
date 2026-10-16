@@ -27,8 +27,10 @@ else:
 	AUDIOBOOKSHELF_INTERNAL_URL = _abs_internal or "http://localhost"
 	AUDIOBOOKSHELF_EXTERNAL_URL = _abs_external or AUDIOBOOKSHELF_INTERNAL_URL
 
-# API endpoints
+# API endpoints. INTERNAL is what this server calls; EXTERNAL is what goes into
+# feeds (covers, images), because the e-reader fetches those itself.
 AUDIOBOOKSHELF_API = AUDIOBOOKSHELF_INTERNAL_URL + "/api"
+AUDIOBOOKSHELF_EXTERNAL_API = AUDIOBOOKSHELF_EXTERNAL_URL + "/api"
 
 # Authentication configuration
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"

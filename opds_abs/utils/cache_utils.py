@@ -12,11 +12,9 @@ import os
 import pickle
 import threading
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, Callable
-import functools
+from typing import Dict, Any, Optional, Tuple
 import hashlib
 import json
-import asyncio
 import base64
 
 # Local application imports
@@ -38,6 +36,9 @@ logger = logging.getLogger(__name__)
 _cache: Dict[str, Tuple[float, Any]] = {}
 _last_save_time = 0
 _cache_lock = threading.RLock()
+# Entries older than every per-endpoint expiry are dropped when saving.
+MAX_CACHE_AGE = max(DEFAULT_CACHE_EXPIRY, LIBRARY_ITEMS_CACHE_EXPIRY, SEARCH_RESULTS_CACHE_EXPIRY,
+                    SERIES_DETAILS_CACHE_EXPIRY, SERIES_ITEMS_CACHE_EXPIRY, AUTHORS_CACHE_EXPIRY)
 
 
 def _create_cache_key(endpoint: str, params: Optional[Dict] = None, username: Optional[str] = None) -> str:
@@ -64,114 +65,71 @@ def _create_cache_key(endpoint: str, params: Optional[Dict] = None, username: Op
     return hashlib.md5(key_str.encode()).hexdigest()
 
 
+# Bump when the cache layout changes, or when old files must not be trusted.
+# v2: written after tokens were removed from cached values; v1 files (a bare dict)
+# contained ABS tokens and are discarded on load.
+CACHE_FORMAT_VERSION = 2
+
+
 def load_cache_from_disk() -> None:
-    """Load the cache from disk if available.
+    """Load the persisted data cache into memory.
 
-    This function attempts to restore the previously saved cache state from disk
-    into memory. It first checks if cache persistence is enabled in the configuration.
-    If the cache file exists, it reads and deserializes the data using pickle.
-
-    The function handles various error conditions gracefully, starting with an empty
-    cache if the file doesn't exist or if there's an error during loading. It also
-    provides detailed logging about the number of items loaded and how many are
-    still valid (non-expired).
-
-    The function uses a thread lock to ensure thread safety during cache loading.
-
-    Raises:
-        pickle.PickleError: If there is an error unpickling the cache data.
-        IOError: If there is an error reading the cache file.
-        EOFError: If the cache file is empty or corrupted.
+    Mutates ``_cache`` in place. DO NOT rebind it: other modules import the dict
+    object, and rebinding left them holding the old empty one.
     """
-    global _cache
-
     if not CACHE_PERSISTENCE_ENABLED:
-        logger.debug("Cache persistence is disabled, skipping load from disk")
         return
-
+    cache_path = Path(CACHE_FILE_PATH)
+    if not cache_path.exists():
+        logger.info("No cache file at %s, starting empty", CACHE_FILE_PATH)
+        return
     try:
-        cache_path = Path(CACHE_FILE_PATH)
-
-        # Create the directory if it doesn't exist
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if not cache_path.exists():
-            logger.info("Cache file does not exist at %s, starting with empty cache", CACHE_FILE_PATH)
-            return
-
         with cache_path.open("rb") as f:
-            with _cache_lock:
-                loaded_cache = pickle.load(f)
-                _cache = loaded_cache
-
-        # Count non-expired items
-        current_time = time.time()
-        valid_items = sum(1 for _, (timestamp, _) in _cache.items()
-                          if current_time - timestamp <= DEFAULT_CACHE_EXPIRY)
-
-        logger.info("Loaded %d cached items from disk (%d non-expired)", len(_cache), valid_items)
-
-    except (pickle.PickleError, IOError, EOFError) as e:
-        logger.warning("Failed to load cache from disk: %s", str(e))
-        # Start with an empty cache if loading fails
-        _cache = {}
+            stored = pickle.load(f)
+    except (pickle.PickleError, OSError, EOFError, AttributeError) as e:
+        logger.warning("Ignoring unreadable cache file %s: %s", CACHE_FILE_PATH, e)
+        return
+    if not isinstance(stored, dict) or stored.get("version") != CACHE_FORMAT_VERSION:
+        logger.warning("Discarding cache file %s written by an older version", CACHE_FILE_PATH)
+        cache_path.unlink(missing_ok=True)
+        return
+    with _cache_lock:
+        _cache.clear()
+        _cache.update(stored["entries"])
+    logger.info("Loaded %d cached items from disk", len(stored["entries"]))
 
 
-def save_cache_to_disk() -> None:
-    """Save the current in-memory cache to disk for persistence.
+def save_cache_to_disk(force: bool = False) -> None:
+    """Persist the data cache, at most every CACHE_SAVE_INTERVAL unless ``force``.
 
-    This function writes the current state of the in-memory cache to a pickle file
-    on disk for persistent storage. Before saving, it cleans expired items from the
-    cache. The function also implements rate-limiting to prevent excessive disk writes
-    by only saving if enough time has passed since the last save operation.
-
-    The function uses a threading lock to prevent race conditions during save operations.
-    If cache persistence is disabled in the configuration, this function does nothing.
-
-    Raises:
-        pickle.PickleError: If there is an error pickling the cache data.
-        IOError: If there is an error writing to the cache file.
+    Copies the dict under the lock and pickles the copy outside it, so requests
+    are not stalled for the length of the dump, then writes a temp file and
+    renames it so a crash mid-write cannot leave a truncated cache.
     """
     global _last_save_time
 
     if not CACHE_PERSISTENCE_ENABLED:
         return
-
-    current_time = time.time()
-
-    # Use a lock to prevent concurrent access during save
+    now = time.time()
     with _cache_lock:
-        # Only save if enough time has passed since last save
-        if current_time - _last_save_time < CACHE_SAVE_INTERVAL:
+        if not force and now - _last_save_time < CACHE_SAVE_INTERVAL:
             return
-
-        # Clean expired items before saving
-        expired_keys = []
-        for key, (timestamp, _) in _cache.items():
-            if current_time - timestamp > DEFAULT_CACHE_EXPIRY:
-                expired_keys.append(key)
-
-        for key in expired_keys:
+        _last_save_time = now
+        for key in [k for k, (ts, _) in _cache.items() if now - ts > MAX_CACHE_AGE]:
             del _cache[key]
+        snapshot = dict(_cache)
 
-        # Update last save time
-        _last_save_time = current_time
-
+    cache_path = Path(CACHE_FILE_PATH)
+    tmp_path = cache_path.with_suffix(".tmp")
     try:
-        cache_path = Path(CACHE_FILE_PATH)
-
-        # Create the directory if it doesn't exist
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Save cache to file
-        with cache_path.open("wb") as f:
-            with _cache_lock:
-                pickle.dump(_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-        logger.debug("Saved %d cache items to %s", len(_cache), CACHE_FILE_PATH)
-
-    except (pickle.PickleError, IOError) as e:
-        logger.error("Failed to save cache to disk: %s", str(e))
+        with tmp_path.open("wb") as f:
+            pickle.dump({"version": CACHE_FORMAT_VERSION, "entries": snapshot}, f,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, cache_path)
+        logger.debug("Saved %d cache items to %s", len(snapshot), CACHE_FILE_PATH)
+    except (pickle.PickleError, OSError) as e:
+        logger.error("Failed to save cache to %s: %s", CACHE_FILE_PATH, e)
 
 
 def cache_get(key: str, max_age: int = DEFAULT_CACHE_EXPIRY, ignore_expiry: bool = False) -> Optional[Any]:
@@ -233,46 +191,9 @@ def clear_cache() -> int:
         logger.info("Cleared %d items from cache", count)
 
     if CACHE_PERSISTENCE_ENABLED:
-        save_cache_to_disk()
+        save_cache_to_disk(force=True)
 
     return count
-
-
-def cached(expiry: int = DEFAULT_CACHE_EXPIRY) -> Callable:
-    """Decorator to cache function results.
-
-    Args:
-        expiry: Cache expiry time in seconds
-
-    Returns:
-        Decorated function with caching
-    """
-    def decorator(func):
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            # Create a cache key based on the function name and arguments
-            func_name = func.__name__
-            args_str = json.dumps([str(a) for a in args], sort_keys=True) if args else "[]"
-            kwargs_str = json.dumps(kwargs, sort_keys=True) if kwargs else "{}"
-
-            cache_key = hashlib.md5(f"{func_name}:{args_str}:{kwargs_str}".encode()).hexdigest()
-
-            # Try to get from cache
-            cached_data = cache_get(cache_key, expiry)
-            if cached_data is not None:
-                logger.debug("Cache hit for %s", func_name)
-                return cached_data
-
-            # Not in cache, call the function
-            logger.debug("Cache miss for %s", func_name)
-            data = await func(*args, **kwargs)
-
-            # Store in cache
-            cache_set(cache_key, data)
-            return data
-
-        return wrapper
-    return decorator
 
 
 async def get_cached_library_items(fetch_from_api_func, filter_items_func, username, library_id, token=None, bypass_cache=False):
@@ -397,6 +318,23 @@ async def get_cached_series_details(fetch_from_api_func, username, library_id, s
         return None
 
 
+def book_authors(author_name, known_authors):
+    """Return the entries of ``known_authors`` that wrote a book with this authorName.
+
+    ``author_name`` is ABS's ", "-joined list. A name that itself contains ", "
+    is matched as a delimited run rather than a single segment.
+    """
+    if not author_name:
+        return []
+    segments = set(author_name.split(", "))
+    padded = f", {author_name}, "
+    return [
+        a for a in known_authors
+        if a.get("id") and a.get("name") and (
+            a["name"] in segments or (", " in a["name"] and f", {a['name']}, " in padded))
+    ]
+
+
 async def get_cached_author_details(fetch_func, filter_func, username, library_id, token=None, bypass_cache=False):
     """Fetch and cache author information, focusing on authors who have books with ebook files.
 
@@ -434,51 +372,27 @@ async def get_cached_author_details(fetch_func, filter_func, username, library_i
         logger.debug("No library items found for library %s", library_id)
         return []
 
-    # First collect basic author info from items
-    authors_with_ebooks = {}
-
-    # Optimize ebook detection with a single pass through the items
-    for item in library_items:
-        media = item.get("media", {})
-        metadata = media.get("metadata", {})
-
-        # Efficient ebook detection
-        has_ebook = (
-            media.get("ebookFile") is not None or
-            (media.get("ebookFormat") is not None and media.get("ebookFormat"))
-        )
-
-        if has_ebook:
-            # Get author name from metadata
-            author_name = metadata.get("authorName")
-            if author_name:
-                # Add or update author in our tracking dictionary
-                if author_name in authors_with_ebooks:
-                    authors_with_ebooks[author_name]["ebook_count"] += 1
-                else:
-                    authors_with_ebooks[author_name] = {
-                        "name": author_name,
-                        "ebook_count": 1,
-                        "id": None,  # Will be populated from author details
-                        "imagePath": None  # Will be populated from author details
-                    }
-
-    # Now get full author details from the API
     authors_params = {"limit": 2000, "sort": "name"}
     author_data = await fetch_func(f"/libraries/{library_id}/authors", authors_params, username=username, token=token)
+    known_authors = author_data.get("authors", []) if author_data else []
 
-    if not author_data or "authors" not in author_data:
-        logger.warning("Failed to retrieve full author details")
-        # Just return what we have so far
-        return list(authors_with_ebooks.values())
-
-    # Enhance author information with details from the author endpoint
-    for author in author_data.get("authors", []):
-        author_name = author.get("name")
-        if author_name and author_name in authors_with_ebooks:
-            # Add ID and image path from author details
-            authors_with_ebooks[author_name]["id"] = author.get("id")
-            authors_with_ebooks[author_name]["imagePath"] = author.get("imagePath")
+    # ABS list payloads only carry authorName, the book's authors joined with ", ".
+    # DO NOT group on that string: a co-written book became one fake author
+    # "Alice Smith, Bob Jones" with no id, and appeared under neither real author.
+    # Match each of ABS's real authors against the joined string instead.
+    authors_with_ebooks = {}
+    for item in library_items:
+        media = item.get("media", {})
+        if media.get("ebookFile") is None and not media.get("ebookFormat"):
+            continue
+        for author in book_authors(media.get("metadata", {}).get("authorName"), known_authors):
+            entry = authors_with_ebooks.setdefault(author["id"], {
+                "name": author.get("name"),
+                "id": author["id"],
+                "imagePath": author.get("imagePath"),
+                "ebook_count": 0,
+            })
+            entry["ebook_count"] += 1
 
     # Convert to list for the caller
     authors_list = list(authors_with_ebooks.values())

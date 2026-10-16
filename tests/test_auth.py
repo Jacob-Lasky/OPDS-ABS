@@ -44,7 +44,7 @@ def test_x_username_header_cannot_select_another_user(client):
 
 
 def test_feeds_never_embed_tokens(client):
-    for path in (f"/opds/alice", f"/opds/alice/libraries/{LIB}", FEED,
+    for path in ("/opds/alice", f"/opds/alice/libraries/{LIB}", FEED,
                  f"/opds/alice/libraries/{LIB}/search?q=dune"):
         body = client.get(path, auth=ALICE).text
         assert "tok-alice" not in body, path

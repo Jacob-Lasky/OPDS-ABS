@@ -7,14 +7,14 @@ from typing import Dict, Any, List, Optional
 # Local application imports
 from opds_abs.core.feed_generator import BaseFeedGenerator
 from opds_abs.api.client import fetch_from_api, get_download_urls_from_item
-from opds_abs.config import AUDIOBOOKSHELF_API, ITEMS_PER_PAGE, PAGINATION_ENABLED
+from opds_abs.config import AUDIOBOOKSHELF_EXTERNAL_API, ITEMS_PER_PAGE, PAGINATION_ENABLED
 from opds_abs.utils import dict_to_xml
-from opds_abs.utils.cache_utils import get_cached_library_items, get_cached_author_details
+from opds_abs.utils.cache_utils import book_authors, get_cached_library_items, get_cached_author_details
 from opds_abs.utils.error_utils import (
     FeedGenerationError,
     ResourceNotFoundError,
+    OPDSBaseException,
     log_error,
-    handle_exception
 )
 
 # Set up logging
@@ -57,74 +57,23 @@ class AuthorFeedGenerator(BaseFeedGenerator):
         return {}
 
     async def filter_items_by_author_id(self, username: str, library_id: str, author_id: str, token: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Filter items by author ID using cached items when possible.
+        """Return the library's ebook items written by one author.
 
-        Args:
-            username (str): The username of the authenticated user.
-            library_id (str): ID of the library containing the items.
-            author_id (str): ID of the author to filter by.
-            token (str, optional): Authentication token for Audiobookshelf.
-
-        Returns:
-            list: Library items filtered by the specified author ID.
+        Filters the cached all-items list with the same joined-name matching the
+        authors list uses (``book_authors``), so the count on the authors page and
+        the books on the author's page always agree, co-written books included.
         """
-        try:
-            # Get author info by ID first - if we don't have it, we can't filter locally
-            author = await self.get_author_by_id(username, library_id, author_id, token=token)
-            author_name = author.get("name")
+        author = await self.get_author_by_id(username, library_id, author_id, token=token)
+        if not author:
+            raise ResourceNotFoundError(f"Author {author_id} has no ebooks in library {library_id}")
 
-            if not author_name:
-                # Fall back to API call if we couldn't find the author name
-                logger.warning("Could not find author name for ID %s, falling back to API filter", author_id)
-                params = {"filter": f"authors.{self.create_filter(author_id)}"}
-                data = await fetch_from_api(
-                        f"/libraries/{library_id}/items",
-                        params,
-                        username=username,
-                        token=token
-                )
-                return self.filter_items(data)
-
-            # Now that we have the author name, get all library items from cache
-            library_items = await get_cached_library_items(
-                fetch_from_api,
-                self.filter_items,
-                username,
-                library_id,
-                token=token
-            )
-
-            logger.debug("Filtering cached items by author: %s", author_name)
-
-            # Use list comprehension for more efficient filtering
-            filtered_items = [
-                item for item in library_items
-                if (
-                    # Check author match
-                    item.get("media", {}).get("metadata", {}).get("authorName") == author_name and
-                    # Check for presence of ebook
-                    (
-                        item.get("media", {}).get("ebookFile") is not None or
-                        (item.get("media", {}).get("ebookFormat") is not None and
-                         item.get("media", {}).get("ebookFormat"))
-                    )
-                )
-            ]
-
-            logger.debug("Found %d ebook items by author %s", len(filtered_items), author_name)
-            return filtered_items
-
-        except Exception as e:
-            logger.error("Error filtering items by author: %s", e)
-            # Fall back to API call if there was an error
-            params = {"filter": f"authors.{self.create_filter(author_id)}"}
-            data = await fetch_from_api(
-                    f"/libraries/{library_id}/items",
-                    params,
-                    username=username,
-                    token=token
-            )
-            return self.filter_items(data)
+        library_items = await get_cached_library_items(
+            fetch_from_api, self.filter_items, username, library_id, token=token)
+        known = [{"id": author_id, "name": author.get("name")}]
+        return [
+            item for item in library_items
+            if book_authors(item.get("media", {}).get("metadata", {}).get("authorName"), known)
+        ]
 
     async def generate_author_items_feed(self, username: str, library_id: str, author_id: str, token: Optional[str] = None,
                                          params: Optional[Dict[str, Any]] = None):
@@ -168,7 +117,7 @@ class AuthorFeedGenerator(BaseFeedGenerator):
             )
 
             # Sort library items by name
-            library_items.sort(key=lambda item: item.get("media", {}).get("metadata", {}).get("title", "").lower())
+            library_items.sort(key=lambda item: (item.get("media", {}).get("metadata", {}).get("title") or "").lower())
 
             # Honor the global pagination config, exactly like the library items feed
             if not PAGINATION_ENABLED:
@@ -190,7 +139,7 @@ class AuthorFeedGenerator(BaseFeedGenerator):
 
             # Build the feed metadata
             feed_data = {
-                "id": {"_text": library_id},
+                "id": {"_text": f"{library_id}/authors/{author_id}"},
                 "author": {
                     "name": {"_text": "OPDS Audiobookshelf"}
                 },
@@ -248,13 +197,10 @@ class AuthorFeedGenerator(BaseFeedGenerator):
 
             return self.create_response(feed)
 
+        except OPDSBaseException:
+            raise
         except Exception as e:
-            # Handle any unexpected errors
-            context = f"Generating author items feed for author {author_id}"
-            log_error(e, context=context)
-
-            # Use handle_exception to return a standardized error response
-            return handle_exception(e, context=context)
+            raise FeedGenerationError(f"Generating author items feed for author {author_id}" + f": {e}") from e
 
     def add_author_to_feed(self, username: str, library_id: str, feed, author: Dict[str, Any], token: Optional[str] = None):
         """Add an author entry to the OPDS feed.
@@ -273,7 +219,7 @@ class AuthorFeedGenerator(BaseFeedGenerator):
             # Get a cover url if we have a book with an ebook
             cover_url = "/static/images/unknown-author.png"
             if author.get("imagePath"):
-                cover_url = f"{AUDIOBOOKSHELF_API}/authors/{author.get('id')}/image?format=jpeg"
+                cover_url = f"{AUDIOBOOKSHELF_EXTERNAL_API}/authors/{author.get('id')}/image?format=jpeg"
 
             # Get author ID and name
             author_id = author.get("id", "")
@@ -304,7 +250,7 @@ class AuthorFeedGenerator(BaseFeedGenerator):
                             "_attrs": {
                                 "href": cover_url,
                                 "rel": "http://opds-spec.org/image",
-                                "type": "image/jpeg"
+                                "type": self.image_type(cover_url)
                             }
                         }
                     ]
@@ -424,7 +370,7 @@ class AuthorFeedGenerator(BaseFeedGenerator):
 
             # Build the feed metadata
             feed_data = {
-                "id": {"_text": library_id},
+                "id": {"_text": f"{library_id}/authors"},
                 "title": {"_text": f"{username}'s authors with ebooks"}
             }
 
@@ -449,7 +395,7 @@ class AuthorFeedGenerator(BaseFeedGenerator):
                     return self.create_response(feed)
 
                 # Sort authors by name
-                authors_list = sorted(authors_list, key=lambda x: x.get("name", "").lower())
+                authors_list = sorted(authors_list, key=lambda x: (x.get("name") or "").lower())
                 logger.debug("Found %d authors with ebooks", len(authors_list))
 
                 # Get total count before pagination
@@ -496,10 +442,7 @@ class AuthorFeedGenerator(BaseFeedGenerator):
 
             return self.create_response(feed)
 
+        except OPDSBaseException:
+            raise
         except Exception as e:
-            # Handle any other unexpected errors
-            context = f"Generating authors feed for user {username}, library {library_id}"
-            log_error(e, context=context)
-
-            # Use handle_exception to return a standardized error response
-            return handle_exception(e, context=context)
+            raise FeedGenerationError(f"Generating authors feed for user {username}, library {library_id}" + f": {e}") from e

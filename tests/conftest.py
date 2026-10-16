@@ -57,6 +57,7 @@ class FakeABS:
     def __init__(self):
         self.logins = []
         self.api_calls = []
+        self.fail_next = set()  # paths that return HTTP 500 once
 
     def _user(self, request):
         auth = request.headers.get("Authorization", "")
@@ -75,6 +76,9 @@ class FakeABS:
         if not self._user(request):
             return web.Response(status=401, text="Unauthorized")
         path = request.path
+        if path in self.fail_next:
+            self.fail_next.discard(path)
+            return web.Response(status=500, text="transient")
         if path == "/api/libraries":
             return web.json_response({"libraries": [{"id": LIB, "name": "Books", "mediaType": "book"}]})
         if path == f"/api/libraries/{LIB}/items":
@@ -123,6 +127,7 @@ def client(fake_abs):
     auth_utils.clear_token_cache()
     fake_abs.logins.clear()
     fake_abs.api_calls.clear()
+    fake_abs.fail_next.clear()
     with TestClient(app, base_url="http://testserver") as c:
         yield c
 
