@@ -29,6 +29,7 @@ from opds_abs.config import (
     CACHE_SAVE_INTERVAL,
     AUTHORS_CACHE_EXPIRY
 )
+from opds_abs.utils.items import has_ebook
 
 logger = logging.getLogger(__name__)
 
@@ -381,7 +382,7 @@ async def get_cached_author_details(fetch_func, filter_func, username, library_i
     authors_with_ebooks = {}
     for item in library_items:
         media = item.get("media", {})
-        if media.get("ebookFile") is None and not media.get("ebookFormat"):
+        if not has_ebook(item):
             continue
         for author in book_authors(media.get("metadata", {}).get("authorName"), known_authors):
             entry = authors_with_ebooks.setdefault(author["id"], {

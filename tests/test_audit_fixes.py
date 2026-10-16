@@ -106,3 +106,11 @@ def test_book_content_is_html_not_xhtml(client):
     feed = etree.fromstring(client.get(f"/opds/alice/libraries/{LIB}/items", auth=ALICE).content)
     types = {c.get("type") for c in feed.iter("{*}content")}
     assert types == {"html"}
+
+
+def test_has_ebook_is_the_one_definition():
+    from opds_abs.utils.items import has_ebook
+    assert has_ebook({"media": {"ebookFormat": "epub"}})             # minified payload
+    assert has_ebook({"media": {"ebookFile": {"ino": "1"}}})          # expanded payload
+    assert not has_ebook({"media": {"ebookFormat": None}})
+    assert not has_ebook({"media": {}}) and not has_ebook({})

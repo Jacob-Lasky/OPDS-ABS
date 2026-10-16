@@ -8,6 +8,7 @@ from opds_abs.core.feed_generator import BaseFeedGenerator
 from opds_abs.api.client import fetch_from_api, get_download_urls_from_item
 from opds_abs.config import AUDIOBOOKSHELF_EXTERNAL_API
 from opds_abs.utils import dict_to_xml
+from opds_abs.utils.items import has_ebook
 from opds_abs.utils.cache_utils import get_cached_library_items, get_cached_series_details
 from opds_abs.utils.error_utils import FeedGenerationError, OPDSBaseException
 
@@ -201,7 +202,7 @@ class SeriesFeedGenerator(BaseFeedGenerator):
         for result in data.get("results", []):
             filtered_books = [
                 book for book in result.get("books", [])
-                if book.get("media", {}).get("ebookFormat") is not None
+                if has_ebook(book)
             ]
 
             if filtered_books:

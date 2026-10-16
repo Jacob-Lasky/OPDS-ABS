@@ -8,6 +8,7 @@ from opds_abs.core.feed_generator import BaseFeedGenerator
 from opds_abs.api.client import fetch_from_api, get_download_urls_from_item
 from opds_abs.config import AUDIOBOOKSHELF_EXTERNAL_API, ITEMS_PER_PAGE, PAGINATION_ENABLED
 from opds_abs.utils import dict_to_xml
+from opds_abs.utils.items import has_ebook
 from opds_abs.utils.cache_utils import get_cached_library_items
 from opds_abs.utils.error_utils import (
     AuthenticationError,
@@ -215,8 +216,7 @@ class CollectionFeedGenerator(BaseFeedGenerator):
             # Use list comprehension for more efficient filtering of books with ebooks
             books_with_ebooks = [
                 book for book in collection.get("books", [])
-                if (book.get("media", {}).get("ebookFile") is not None or
-                   (book.get("media", {}).get("ebookFormat") is not None and book.get("media", {}).get("ebookFormat")))
+                if has_ebook(book)
             ]
 
             # Get the book count for the entry content
@@ -318,7 +318,7 @@ class CollectionFeedGenerator(BaseFeedGenerator):
                     collection_errors.append(f"Collection {collection_id}: {collection_data}")
                     continue
                 ebook_count = sum(1 for book in collection_data.get("books", [])
-                                  if self._book_has_ebook(book))
+                                  if has_ebook(book))
                 if ebook_count:
                     filtered_collections.append(collection_data)
 
@@ -360,11 +360,6 @@ class CollectionFeedGenerator(BaseFeedGenerator):
             raise
         except Exception as e:
             raise FeedGenerationError(f"Generating collections feed for user {username}, library {library_id}" + f": {e}") from e
-
-    @staticmethod
-    def _book_has_ebook(book):
-        media = book.get("media", {})
-        return media.get("ebookFile") is not None or bool(media.get("ebookFormat"))
 
     async def get_collections(self, username, library_id, token=None):
         """Fetch all collections available in a library.

@@ -12,6 +12,7 @@ from fastapi.responses import Response
 # Local application imports
 from opds_abs.config import AUDIOBOOKSHELF_EXTERNAL_API
 from opds_abs.utils import dict_to_xml
+from opds_abs.utils.items import has_ebook
 from opds_abs.utils.error_utils import FeedGenerationError, log_error
 
 # Mapping of ebook formats to correct MIME types for OPDS
@@ -325,8 +326,7 @@ class BaseFeedGenerator:
             n = 1
             filtered_results = []
             for result in data.get("results", []):
-                media = result.get("media", {})
-                if "ebookFormat" in media and media.get("ebookFormat", None):
+                if has_ebook(result):
                     result.update({"opds_seq":n})
                     n += 1
                     filtered_results.append(result)

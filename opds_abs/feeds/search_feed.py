@@ -11,6 +11,7 @@ from opds_abs.api.client import fetch_from_api, get_download_urls_from_item
 from opds_abs.feeds.author_feed import AuthorFeedGenerator
 from opds_abs.feeds.series_feed import SeriesFeedGenerator
 from opds_abs.utils import dict_to_xml
+from opds_abs.utils.items import has_ebook
 from opds_abs.utils.cache_utils import get_cached_library_items, get_cached_search_results
 
 # Set up logging
@@ -180,21 +181,9 @@ class SearchFeedGenerator(BaseFeedGenerator):
         """
         lib_item = book_result.get("libraryItem") or {}
         book_id = lib_item.get("id")
-        if not book_id or not self._has_ebook_file(lib_item):
+        if not book_id or not has_ebook(lib_item):
             return None
         return book_id_map.get(book_id) or lib_item
-
-    def _has_ebook_file(self, lib_item):
-        """Check if a library item has an ebook file.
-
-        Args:
-            lib_item: Dictionary containing library item metadata from Audiobookshelf API.
-
-        Returns:
-            bool: True if the item has an ebook file or format, False otherwise.
-        """
-        media = lib_item.get("media", {})
-        return bool(media.get("ebookFile", media.get("ebookFormat", None)))
 
     async def _process_series(self, feed, search_data, username, library_id, cached_library_items, token=None):
         """Process series search results and add them to the feed.
@@ -247,7 +236,7 @@ class SearchFeedGenerator(BaseFeedGenerator):
             series_data = series_result.get('series', {})
             books_with_ebooks = [
                 book for book in series_result.get('books', [])
-                if self._has_ebook_file(book)
+                if has_ebook(book)
             ]
 
             # If this series has books with ebooks, add it to our list to process later
@@ -467,7 +456,7 @@ class SearchFeedGenerator(BaseFeedGenerator):
         for item in cached_library_items:
             author_name = item.get("media", {}).get("metadata", {}).get("authorName")
             if author_name and author_name in search_author_names:
-                if self._has_ebook_file(item):
+                if has_ebook(item):
                     author_ebook_counts[author_name] += 1
 
         return author_ebook_counts

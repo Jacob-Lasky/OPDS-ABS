@@ -12,6 +12,7 @@ from fastapi.responses import RedirectResponse
 from opds_abs.core.feed_generator import BaseFeedGenerator
 from opds_abs.api.client import fetch_from_api, get_download_urls_from_item
 from opds_abs.utils import dict_to_xml
+from opds_abs.utils.items import has_ebook
 from opds_abs.utils.cache_utils import get_cached_library_items
 from opds_abs.config import ITEMS_PER_PAGE, PAGINATION_ENABLED
 
@@ -278,11 +279,10 @@ class LibraryFeedGenerator(BaseFeedGenerator):
         Collection payloads can carry ebookFile without ebookFormat, which the
         feed needs to pick a MIME type.
         """
-        media = book.get("media", {})
-        ebook_file = media.get("ebookFile")
-        if ebook_file is not None:
-            if not media.get("ebookFormat"):
-                ext = (ebook_file.get("metadata") or {}).get("ext", "").lstrip(".")
-                media["ebookFormat"] = ext or "epub"
-            return True
-        return bool(media.get("ebookFormat"))
+        if not has_ebook(book):
+            return False
+        media = book["media"]
+        if not media.get("ebookFormat"):
+            ext = ((media.get("ebookFile") or {}).get("metadata") or {}).get("ext", "").lstrip(".")
+            media["ebookFormat"] = ext or "epub"
+        return True
