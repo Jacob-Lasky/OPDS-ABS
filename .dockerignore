@@ -4,3 +4,4 @@
 .pytest_cache
 **/__pycache__
 tests
+opds_abs/data/*

@@ -4,3 +4,5 @@ __pycache__/
 .env
 .venv/
 .pytest_cache/
+opds_abs/data/*
+!opds_abs/data/.gitkeep
