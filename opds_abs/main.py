@@ -45,10 +45,11 @@ error handling and authentication patterns applied consistently.
 import logging
 import time
 import atexit
+from email.message import Message
 import os
 import re
 import unicodedata
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 
 
@@ -76,7 +77,6 @@ from opds_abs.feeds.collection_feed import CollectionFeedGenerator
 from opds_abs.feeds.author_feed import AuthorFeedGenerator
 from opds_abs.feeds.search_feed import SearchFeedGenerator
 from opds_abs.utils.cache_utils import _cache, clear_cache, load_cache_from_disk, save_cache_to_disk
-from opds_abs.api.client import invalidate_cache
 from opds_abs.utils.auth_utils import (
     CHALLENGE_HEADERS, get_authenticated_user, invalidate_token, require_admin)
 from opds_abs.utils.logging_utils import AccessLogMiddleware, configure_logging
@@ -84,7 +84,6 @@ from opds_abs.utils.error_utils import (
     APIClientError,
     AuthenticationError,
     OPDSBaseException,
-    ResourceNotFoundError,
     error_response,
 )
 
@@ -157,9 +156,10 @@ templates = Jinja2Templates(directory="opds_abs/templates")
 if CACHE_PERSISTENCE_ENABLED:
     atexit.register(save_cache_to_disk, True)
 
-# Exception handlers. Routes do not catch exceptions themselves: everything lands
-# here, is logged exactly once, and becomes an escaped XML error document whose
-# <id> is the request id from the access log line.
+# Exception handlers. Routes do not catch exceptions themselves: known types land
+# here, are logged once, and become an escaped XML error document whose <id> is
+# the request id from the access log line. Anything unexpected is answered by
+# AccessLogMiddleware (see the comment there for why not here).
 def _request_id(request: Request) -> str:
     return getattr(request.state, "request_id", "-")
 
@@ -195,13 +195,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code != 401:  # 401 challenges are routine and already in the access log
         logger.info("HTTP %d on %s: %s", exc.status_code, request.url.path, exc.detail)
     return error_response(exc.status_code, exc.detail, _request_id(request), headers=exc.headers)
-
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    """Anything else is a bug: log the traceback once and return a generic 500."""
-    logger.error("Unhandled %s on %s", type(exc).__name__, request.url.path, exc_info=exc)
-    return error_response(500, "Internal server error", _request_id(request))
 
 
 def _canonical_user_redirect(request: Request, username: str, auth_info: tuple):
@@ -708,24 +701,6 @@ async def clear_all_cache(auth_info: tuple = Depends(require_admin)):
     return JSONResponse(content={"message": f"Cleared {count} items from cache"})
 
 
-@app.post("/admin/cache/invalidate")
-async def invalidate_specific_cache(
-    endpoint: str = None,
-    username: str = None,
-    auth_info: tuple = Depends(require_admin)
-):
-    """Invalidate the cached response for one ABS API endpoint (ABS admin/root only).
-
-    Raises:
-        ResourceNotFoundError: If no endpoint was given or nothing was cached for it.
-    """
-    if not endpoint:
-        raise ResourceNotFoundError("Endpoint parameter is required")
-    if not invalidate_cache(endpoint, username=username):
-        raise ResourceNotFoundError(f"No cache found for {endpoint}")
-    return JSONResponse(content={"message": f"Invalidated cache for {endpoint}"})
-
-
 _ABS_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -735,16 +710,13 @@ def _content_disposition(upstream_value: str, fallback: str) -> str:
     HTTP headers are latin-1 on the wire, so passing ABS's header through with a
     filename like "Märchen.epub" raised UnicodeEncodeError and the download
     500ed. Emit an ASCII ``filename`` fallback plus RFC 5987 ``filename*``.
+    The upstream value is parsed with the stdlib MIME parser, which handles
+    quoted names containing ';' and RFC 2231 ``filename*``; a regex cut
+    "foo;bar.epub" down to "foo".
     """
-    name = None
-    star = re.search(r"filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)", upstream_value or "")
-    if star:
-        name = unquote(star.group(1).strip())
-    else:
-        plain = re.search(r'filename\s*=\s*"?([^";]+)"?', upstream_value or "")
-        if plain:
-            name = plain.group(1).strip()
-    name = name or fallback
+    msg = Message()
+    msg["content-disposition"] = upstream_value or ""
+    name = (msg.get_filename() or "").replace("\r", "").replace("\n", "").strip() or fallback
     ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
     ascii_name = re.sub(r'["\\\r\n]', "", ascii_name).strip() or fallback
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name, safe='')}"
@@ -780,6 +752,10 @@ async def proxy_download(
         await session.close()
         logger.error("Download item=%s file=%s: cannot reach Audiobookshelf: %s", item_id, file_ino, e)
         raise HTTPException(status_code=503, detail="Audiobookshelf server is unavailable") from None
+    except BaseException:
+        # Client went away (cancellation) while waiting for ABS's headers.
+        await session.close()
+        raise
 
     if upstream.status != 200:
         upstream.release()

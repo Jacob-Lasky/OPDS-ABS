@@ -34,7 +34,9 @@ AUDIOBOOKSHELF_EXTERNAL_API = AUDIOBOOKSHELF_EXTERNAL_URL + "/api"
 
 # Authentication configuration
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
-AUTH_CACHE_EXPIRY = int(os.getenv("AUTH_CACHE_EXPIRY", "86400"))  # Default: 24 hours
+# Seconds a verified username+password is trusted without asking ABS again. Also how
+# long an old password keeps working after a password change, so keep it short.
+AUTH_CACHE_EXPIRY = int(os.getenv("AUTH_CACHE_EXPIRY", "3600"))
 API_KEY_AUTH_ENABLED = os.getenv("API_KEY_AUTH_ENABLED", "true").lower() == "true"  # Enable API key authentication
 AUTH_TOKEN_CACHING = os.getenv("AUTH_TOKEN_CACHING", "true").lower() == "true"  # Enable token caching
 

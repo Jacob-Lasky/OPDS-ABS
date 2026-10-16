@@ -53,7 +53,7 @@ The `/admin/cache/*` endpoints require an ABS `root` or `admin` account.
 | `AUTH_ENABLED` | `true` | Require ABS credentials. |
 | `API_KEY_AUTH_ENABLED` | `true` | Also accept ABS API keys (see above). |
 | `AUTH_TOKEN_CACHING` | `true` | Cache ABS tokens in memory per credential. |
-| `AUTH_CACHE_EXPIRY` | `86400` | Seconds a cached token is reused before logging in again. |
+| `AUTH_CACHE_EXPIRY` | `3600` | Seconds verified credentials are reused before checking ABS again; also how long an old password keeps working after a change. |
 | `PAGINATION_ENABLED` | `true` | Paginate large feeds. |
 | `ITEMS_PER_PAGE` | `25` | Page size; `0` disables pagination. |
 | `CACHE_PERSISTENCE_ENABLED` | `true` | Persist the ABS response cache to `data/cache.pkl`. |

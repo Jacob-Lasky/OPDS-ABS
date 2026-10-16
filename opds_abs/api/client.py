@@ -20,7 +20,7 @@ from opds_abs.config import (
     SEARCH_RESULTS_CACHE_EXPIRY,
     SERIES_DETAILS_CACHE_EXPIRY
 )
-from opds_abs.utils.cache_utils import _create_cache_key, cache_get, cache_set, _cache
+from opds_abs.utils.cache_utils import _create_cache_key, cache_get, cache_set
 from opds_abs.utils.error_utils import AuthenticationError, APIClientError, ResourceNotFoundError, log_error
 from opds_abs.utils.auth_utils import invalidate_token
 
@@ -90,7 +90,7 @@ async def fetch_from_api(
             break
 
     # Create a cache key for this request
-    cache_key = _create_cache_key(endpoint, params, username)
+    cache_key = _create_cache_key(endpoint, params, username, token)
 
     # Try to get from cache if not bypassing
     if not bypass_cache:
@@ -224,19 +224,3 @@ async def get_download_urls_from_item(
     except Exception as e:
         logger.warning("Could not list ebook files for item %s, omitting it from this feed: %s", item_id, e)
         return []
-
-def invalidate_cache(endpoint: str = None, params: dict = None, username: str = None):
-    """Invalidate cache for a specific endpoint or item.
-
-    Args:
-        endpoint: API endpoint to invalidate cache for (if None, key must be provided)
-        params: Query parameters (optional)
-        username: Username for user-specific cache (optional)
-    """
-    if endpoint:
-        cache_key = _create_cache_key(endpoint, params, username)
-        if cache_key in _cache:
-            del _cache[cache_key]
-            logger.debug("Invalidated cache for %s", endpoint)
-            return True
-    return False

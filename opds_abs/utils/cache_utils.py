@@ -36,39 +36,34 @@ logger = logging.getLogger(__name__)
 _cache: Dict[str, Tuple[float, Any]] = {}
 _last_save_time = 0
 _cache_lock = threading.RLock()
+# Serialises whole saves (snapshot + write + rename) so an older snapshot can never
+# be renamed over a newer one, e.g. a background save landing after a clear.
+_save_lock = threading.Lock()
 # Entries older than every per-endpoint expiry are dropped when saving.
 MAX_CACHE_AGE = max(DEFAULT_CACHE_EXPIRY, LIBRARY_ITEMS_CACHE_EXPIRY, SEARCH_RESULTS_CACHE_EXPIRY,
                     SERIES_DETAILS_CACHE_EXPIRY, SERIES_ITEMS_CACHE_EXPIRY, AUTHORS_CACHE_EXPIRY)
 
 
-def _create_cache_key(endpoint: str, params: Optional[Dict] = None, username: Optional[str] = None) -> str:
-    """Create a unique cache key from the endpoint and parameters.
+def _create_cache_key(endpoint: str, params: Optional[Dict] = None, username: Optional[str] = None,
+                      token: Optional[str] = None) -> str:
+    """Hash endpoint, params, username and a token fingerprint into a cache key.
 
-    Args:
-        endpoint: API endpoint
-        params: Query parameters
-        username: Username for user-specific caching
-
-    Returns:
-        A unique string key for the cache
+    The token is part of the key, not just the username: keyed on the name alone,
+    a re-created account with the same username, or a user whose library access
+    was revoked, kept being served the old account's cached catalog. Only a hash
+    of the token reaches the key, and keys are hashed again, so no token is ever
+    stored in the (persisted) cache.
     """
-    # Convert params to a stable string representation
+    token_fp = hashlib.sha256(token.encode()).hexdigest()[:16] if token else ""
     params_str = json.dumps(params, sort_keys=True) if params else "{}"
-
-    # Create components for the key
-    components = [endpoint, params_str]
-    if username:
-        components.append(username)
-
-    # Create a hash of the components
-    key_str = "".join(components)
-    return hashlib.md5(key_str.encode()).hexdigest()
+    key_str = "\0".join([endpoint, params_str, username or "", token_fp])
+    return hashlib.sha256(key_str.encode()).hexdigest()
 
 
 # Bump when the cache layout changes, or when old files must not be trusted.
-# v2: written after tokens were removed from cached values; v1 files (a bare dict)
-# contained ABS tokens and are discarded on load.
-CACHE_FORMAT_VERSION = 2
+# v3: keys include a token fingerprint. v2 keys did not; v1 files (a bare dict)
+# contained ABS tokens. Older files are discarded on load.
+CACHE_FORMAT_VERSION = 3
 
 
 def load_cache_from_disk() -> None:
@@ -102,34 +97,37 @@ def load_cache_from_disk() -> None:
 def save_cache_to_disk(force: bool = False) -> None:
     """Persist the data cache, at most every CACHE_SAVE_INTERVAL unless ``force``.
 
-    Copies the dict under the lock and pickles the copy outside it, so requests
-    are not stalled for the length of the dump, then writes a temp file and
-    renames it so a crash mid-write cannot leave a truncated cache.
+    Copies the dict under the cache lock and pickles the copy outside it, so
+    requests are not stalled for the length of the dump, then writes a temp file
+    and renames it so a crash mid-write cannot leave a truncated cache. The whole
+    sequence holds ``_save_lock``, so concurrent saves (background thread, admin
+    clear, shutdown) finish in order and share the temp file safely.
     """
     global _last_save_time
 
     if not CACHE_PERSISTENCE_ENABLED:
         return
-    now = time.time()
-    with _cache_lock:
-        if not force and now - _last_save_time < CACHE_SAVE_INTERVAL:
-            return
-        _last_save_time = now
-        for key in [k for k, (ts, _) in _cache.items() if now - ts > MAX_CACHE_AGE]:
-            del _cache[key]
-        snapshot = dict(_cache)
+    with _save_lock:
+        now = time.time()
+        with _cache_lock:
+            if not force and now - _last_save_time < CACHE_SAVE_INTERVAL:
+                return
+            _last_save_time = now
+            for key in [k for k, (ts, _) in _cache.items() if now - ts > MAX_CACHE_AGE]:
+                del _cache[key]
+            snapshot = dict(_cache)
 
-    cache_path = Path(CACHE_FILE_PATH)
-    tmp_path = cache_path.with_suffix(".tmp")
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with tmp_path.open("wb") as f:
-            pickle.dump({"version": CACHE_FORMAT_VERSION, "entries": snapshot}, f,
-                        protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp_path, cache_path)
-        logger.debug("Saved %d cache items to %s", len(snapshot), CACHE_FILE_PATH)
-    except (pickle.PickleError, OSError) as e:
-        logger.error("Failed to save cache to %s: %s", CACHE_FILE_PATH, e)
+        cache_path = Path(CACHE_FILE_PATH)
+        tmp_path = cache_path.with_suffix(".tmp")
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with tmp_path.open("wb") as f:
+                pickle.dump({"version": CACHE_FORMAT_VERSION, "entries": snapshot}, f,
+                            protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, cache_path)
+            logger.debug("Saved %d cache items to %s", len(snapshot), CACHE_FILE_PATH)
+        except (pickle.PickleError, OSError) as e:
+            logger.error("Failed to save cache to %s: %s", CACHE_FILE_PATH, e)
 
 
 def cache_get(key: str, max_age: int = DEFAULT_CACHE_EXPIRY, ignore_expiry: bool = False) -> Optional[Any]:
@@ -213,7 +211,7 @@ async def get_cached_library_items(fetch_from_api_func, filter_items_func, usern
     Returns:
         list: All filtered library items containing ebooks.
     """
-    cache_key = _create_cache_key(f"/library-items-all/{library_id}", None, username)
+    cache_key = _create_cache_key(f"/library-items-all/{library_id}", None, username, token)
 
     # Try to get from cache if not bypassing
     if not bypass_cache:
@@ -248,7 +246,7 @@ async def get_cached_search_results(fetch_from_api_func, username, library_id, q
     Returns:
         dict: Search results from API or cache.
     """
-    cache_key = _create_cache_key(f"/libraries/{library_id}/search", {"q": query}, username)
+    cache_key = _create_cache_key(f"/libraries/{library_id}/search", {"q": query}, username, token)
 
     # Try to get from cache if not bypassing
     if not bypass_cache:
@@ -285,7 +283,7 @@ async def get_cached_series_details(fetch_from_api_func, username, library_id, s
         dict: Series details or None if not found.
     """
     # Create a cache key for this specific series
-    cache_key = _create_cache_key(f"/series-details/{library_id}/{series_id}", None, username)
+    cache_key = _create_cache_key(f"/series-details/{library_id}/{series_id}", None, username, token)
 
     # Try to get from cache first
     cached_data = cache_get(cache_key, SERIES_DETAILS_CACHE_EXPIRY)
@@ -350,7 +348,7 @@ async def get_cached_author_details(fetch_func, filter_func, username, library_i
         list: A list of dictionaries containing author information with ebook counts.
     """
     # Create a cache key specifically for authors with ebooks
-    cache_key = _create_cache_key(f"/authors-with-ebooks/{library_id}", None, username)
+    cache_key = _create_cache_key(f"/authors-with-ebooks/{library_id}", None, username, token)
 
     # Try to get from cache first if not bypassing
     if not bypass_cache:
@@ -422,7 +420,7 @@ async def get_cached_series_items(fetch_from_api_func, filter_items_func, userna
         list: Library items filtered by the specified series ID with sequence information.
     """
     # Create a cache key for this specific series items
-    cache_key = _create_cache_key(f"/series-items/{library_id}/{series_id}", None, username)
+    cache_key = _create_cache_key(f"/series-items/{library_id}/{series_id}", None, username, token)
 
     # Try to get from cache if not bypassing
     if not bypass_cache:

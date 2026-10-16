@@ -23,6 +23,7 @@ from urllib.parse import parse_qsl, urlencode
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from opds_abs.config import LOG_FORMAT, LOG_LEVEL
+from opds_abs.utils.error_utils import error_response
 
 # Request id of the request being handled, for log lines emitted deeper down.
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
@@ -108,10 +109,12 @@ class AccessLogMiddleware:
         start = time.perf_counter()
         status = 500
         sent = 0
+        started = False
 
         async def send_wrapper(message: Message) -> None:
-            nonlocal status, sent
+            nonlocal status, sent, started
             if message["type"] == "http.response.start":
+                started = True
                 status = message["status"]
                 headers = list(message.get("headers", []))
                 headers.append((b"x-request-id", request_id.encode()))
@@ -123,8 +126,14 @@ class AccessLogMiddleware:
         try:
             await self.app(scope, receive, send_wrapper)
         except Exception:
+            # Answer here rather than letting Starlette's outermost error
+            # middleware do it: that runs after this one has reset the request
+            # id, so the 500 lost its X-Request-ID and its log lines said req=-.
             access_logger.exception("Unhandled error")
-            raise
+            if started:
+                raise  # too late for an error body; the client sees a cut stream
+            response = error_response(500, "Internal server error", request_id)
+            await response(scope, receive, send_wrapper)
         finally:
             elapsed_ms = (time.perf_counter() - start) * 1000
             state = scope.get("state", {})

@@ -137,7 +137,9 @@ def get_credentials_from_request(request: Request) -> Optional[Credentials]:
         return Credentials("bearer", None, value)
 
     if header:
-        logger.warning("Unsupported Authorization scheme %r", scheme)
+        # DO NOT log the scheme text: "Bearerabc123" (no space) is one token, and
+        # logging it disclosed the credential.
+        logger.warning("Unsupported or malformed Authorization header (%d chars)", len(header))
 
     token_param = request.query_params.get("token")
     if token_param and API_KEY_AUTH_ENABLED:
