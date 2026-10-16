@@ -301,10 +301,7 @@ class CollectionFeedGenerator(BaseFeedGenerator):
                         cover_url = f"{book_path}/cover?format=jpeg"
                         break
 
-            # Add token to the collection link if provided
             collection_link = f"/opds/{username}/libraries/{library_id}/collections/{collection_id}"
-            if token:
-                collection_link = f"{collection_link}?token={token}"
 
             # Create entry data structure
             entry_data = {

@@ -45,22 +45,29 @@ error handling and authentication patterns applied consistently.
 import logging
 import time
 import atexit
+import re
+import unicodedata
+from urllib.parse import quote, unquote
 from contextlib import asynccontextmanager
 
 
 # Third-party imports
+import aiohttp
+from lxml import etree
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.exception_handlers import http_exception_handler
+
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 # Local application imports
 from opds_abs.config import (
     LOG_LEVEL, AUTH_ENABLED, CACHE_PERSISTENCE_ENABLED, AUDIOBOOKSHELF_API,
     AUDIOBOOKSHELF_INTERNAL_URL, AUDIOBOOKSHELF_EXTERNAL_URL,
     API_KEY_AUTH_ENABLED, AUTH_TOKEN_CACHING,
-    PAGINATION_ENABLED, ITEMS_PER_PAGE
+    PAGINATION_ENABLED, ITEMS_PER_PAGE, FORWARDED_ALLOW_IPS
 )
 from opds_abs.feeds.library_feed import LibraryFeedGenerator
 from opds_abs.feeds.navigation_feed import NavigationFeedGenerator
@@ -70,7 +77,8 @@ from opds_abs.feeds.author_feed import AuthorFeedGenerator
 from opds_abs.feeds.search_feed import SearchFeedGenerator
 from opds_abs.utils.cache_utils import _cache, clear_cache, load_cache_from_disk, save_cache_to_disk
 from opds_abs.api.client import invalidate_cache
-from opds_abs.utils.auth_utils import get_authenticated_user, require_auth
+from opds_abs.utils.auth_utils import CHALLENGE_HEADERS, get_authenticated_user, invalidate_token
+from opds_abs.utils.logging_utils import AccessLogMiddleware, configure_logging
 from opds_abs.utils.error_utils import (
     OPDSBaseException,
     ResourceNotFoundError,
@@ -82,68 +90,8 @@ from opds_abs.utils.error_utils import (
     AuthenticationError
 )
 
-# Define custom formatter to match uvicorn's style exactly
-class ColorFormatter(logging.Formatter):
-    """Custom log formatter that adds ANSI color codes to log levels.
-
-    This formatter is designed to match uvicorn's log style with colorized
-    log level names.
-    """
-
-    # ANSI color codes
-    COLORS = {
-        "DEBUG": "\033[36m",  # Cyan
-        "INFO": "\033[32m",   # Green
-        "WARNING": "\033[33m", # Yellow
-        "ERROR": "\033[31m",   # Red
-        "CRITICAL": "\033[1;31m", # Bold Red
-        "RESET": "\033[0m"     # Reset
-    }
-
-    def format(self, record):
-        """Format log record with color prefix.
-
-        Args:
-            record (LogRecord): The log record to format.
-
-        Returns:
-            str: The formatted log record with colorized level name.
-        """
-        if not hasattr(record, 'levelprefix'):
-            level_name_length = len(record.levelname)
-            spaces_needed = 8 - level_name_length
-            spaces = " " * spaces_needed
-
-            # Apply color to level name only, not colon or spaces
-            levelname_color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
-            record.levelprefix = f"{levelname_color}{record.levelname}{self.COLORS['RESET']}:{spaces}"
-        return super().format(record)
-
-# Set up logging for the entire application
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(levelprefix)s %(message)s",
-    datefmt="[%X]",
-    force=True,  # Override any existing configuration
-)
-
-# Apply the formatter to the root handler
-for handler in logging.root.handlers:
-    handler.setFormatter(ColorFormatter("%(levelprefix)s %(message)s"))
-
-# Create a logger for this module
+configure_logging()
 logger = logging.getLogger(__name__)
-
-# Set more specific log level for our app's loggers
-app_logger = logging.getLogger("opds_abs")
-try:
-    app_logger.setLevel(getattr(logging, LOG_LEVEL))
-except AttributeError:
-    app_logger.setLevel(logging.INFO)
-    logger.warning("Invalid log level '%s', defaulting to INFO", LOG_LEVEL)
-
-# Log that we've configured logging
-logger.info("OPDS-ABS logging configured at %s level", LOG_LEVEL)
 
 # Create instances of our feed generators
 library_feed = LibraryFeedGenerator()
@@ -193,6 +141,12 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan
 )
+
+# The last middleware added is the outermost. ProxyHeaders goes outside the access
+# log so the log sees the real client IP and scheme. It lives in the app rather
+# than behind uvicorn's proxy_headers flag so the tests exercise it too.
+app.add_middleware(AccessLogMiddleware)
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=FORWARDED_ALLOW_IPS)
 
 # Mount static files directory
 app.mount("/static", StaticFiles(directory="opds_abs/static"), name="static")
@@ -375,6 +329,25 @@ async def custom_http_exception_handler(request: Request, exc: HTTPException):
     log_error(exc, context=context, log_traceback=False)
     return await http_exception_handler(request, exc)
 
+def _canonical_user_redirect(request: Request, username: str, auth_info: tuple):
+    """Redirect /opds/<username>/... to the authenticated ABS username.
+
+    Feed URLs carry the username, but the credentials decide who the caller is.
+    Returns None when they already agree (or auth is disabled). The query string
+    is forwarded still encoded: rebuilding it from parsed params broke any value
+    with a space or '&' in it, e.g. a search for "harry potter".
+    """
+    auth_username, _, display_name = auth_info
+    if not (AUTH_ENABLED and auth_username) or username == display_name:
+        return None
+    segments = request.url.path.split("/")
+    segments[2] = display_name  # ["", "opds", <username>, ...]
+    url = "/".join(quote(seg, safe="") for seg in segments)
+    if request.url.query:
+        url += f"?{request.url.query}"
+    return RedirectResponse(url=url)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     """Render the index page.
@@ -426,48 +399,50 @@ async def opds_root_redirect(
     return RedirectResponse(url=f"/opds/{display_name}")
 
 
-@app.get("/opds/{username}/libraries/{library_id}/search.xml", response_class=HTMLResponse)
-async def search_xml(
-    username: str,
-    library_id: str,
-    request: Request,
-    auth_info: tuple = Depends(get_authenticated_user)
-):
-    """Render the search XML template.
+@app.get("/opds/{username}/libraries/{library_id}/search.xml")
+async def search_xml(username: str, library_id: str, request: Request):
+    """Serve the OpenSearch description document for a library.
 
-    Args:
-        username (str): The username path parameter.
-        library_id (str): ID of the library to search in.
-        request (Request): The incoming request object.
-        auth_info (tuple): The authentication info (username, token, display_name).
+    Clients (Marvin, KOReader, Thorium...) fetch this from the feed's
+    ``rel="search"`` link, then substitute ``{searchTerms}`` into the template.
 
-    Returns:
-        HTMLResponse: The rendered search.xml template.
+    DO NOT go back to rendering this from a Jinja template with the user's token
+    appended. ``...&token=<jwt>`` put a bare ``&`` in an XML attribute, so every
+    authenticated client received a document that does not parse, and Marvin
+    silently never searched (#1). It is built with lxml, so it is always well
+    formed, and it carries no credentials: the search request authenticates the
+    same way as every other feed request.
+
+    No auth dependency: the document holds nothing that is not already in the URL,
+    and some clients fetch it without sending credentials.
     """
-    try:
-        auth_username, token, display_name = auth_info
-
-        # Ensure this is the authenticated user's feed or authentication is disabled
-        if AUTH_ENABLED and auth_username and username != display_name:
-            return RedirectResponse(url=f"/opds/{display_name}/libraries/{library_id}/search.xml")
-
-        params = dict(request.query_params)
-        return templates.TemplateResponse("search.xml", {
-            "request": request,
-            "username": display_name if auth_username else username,
-            "library_id": library_id,
-            "searchTerms": params.get('q', ''),
-            "token": token  # Add token to the template context
-        })
-    except Exception as e:
-        log_error(e, context=f"Rendering search XML for user {username}, library {library_id}")
-        raise convert_to_http_exception(e, status_code=500,
-            detail="Failed to render search template") from e
+    search_url = request.url_for(
+        "opds_search", username=username, library_id=library_id)
+    osd = etree.Element(
+        "OpenSearchDescription", nsmap={None: "http://a9.com/-/spec/opensearch/1.1/"})
+    for tag, text in (
+        ("ShortName", "OPDS-ABS"),
+        ("LongName", "Audiobookshelf OPDS catalog"),
+        ("Description", "Search the Audiobookshelf ebook catalog."),
+        ("InputEncoding", "UTF-8"),
+        ("OutputEncoding", "UTF-8"),
+    ):
+        etree.SubElement(osd, tag).text = text
+    etree.SubElement(osd, "Url", {
+        "type": "application/atom+xml;profile=opds-catalog;kind=acquisition",
+        # Absolute: OpenSearch templates are not reliably resolved against the
+        # description's URL by clients. Behind a proxy this needs uvicorn's
+        # proxy_headers (FORWARDED_ALLOW_IPS) so the scheme is https.
+        "template": f"{search_url}?q={{searchTerms}}",
+    })
+    body = etree.tostring(osd, xml_declaration=True, encoding="UTF-8", pretty_print=True)
+    return Response(content=body, media_type="application/opensearchdescription+xml")
 
 
 @app.get("/opds/{username}")
 async def opds_root(
     username: str,
+    request: Request,
     auth_info: tuple = Depends(get_authenticated_user)
 ):
     """Get the root OPDS feed for a user.
@@ -482,9 +457,9 @@ async def opds_root(
     try:
         auth_username, token, display_name = auth_info
 
-        # Ensure this is the authenticated user's feed or authentication is disabled
-        if AUTH_ENABLED and auth_username and username != display_name:
-            return RedirectResponse(url=f"/opds/{display_name}")
+        redirect = _canonical_user_redirect(request, username, auth_info)
+        if redirect:
+            return redirect
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -505,6 +480,7 @@ async def opds_root(
 @app.get("/opds/{username}/libraries/{library_id}")
 async def opds_nav(
     username: str,
+    request: Request,
     library_id: str,
     auth_info: tuple = Depends(get_authenticated_user)
 ):
@@ -521,9 +497,9 @@ async def opds_nav(
     try:
         auth_username, token, display_name = auth_info
 
-        # Ensure this is the authenticated user's feed or authentication is disabled
-        if AUTH_ENABLED and auth_username and username != display_name:
-            return RedirectResponse(url=f"/opds/{display_name}/libraries/{library_id}")
+        redirect = _canonical_user_redirect(request, username, auth_info)
+        if redirect:
+            return redirect
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -563,14 +539,9 @@ async def opds_search(
     try:
         auth_username, token, display_name = auth_info
 
-        # Ensure this is the authenticated user's feed or authentication is disabled
-        if AUTH_ENABLED and auth_username and username != display_name:
-            # Preserve search parameters in the redirect
-            params_str = "&".join([f"{k}={v}" for k, v in request.query_params.items()])
-            redirect_url = f"/opds/{display_name}/libraries/{library_id}/search"
-            if params_str:
-                redirect_url += f"?{params_str}"
-            return RedirectResponse(url=redirect_url)
+        redirect = _canonical_user_redirect(request, username, auth_info)
+        if redirect:
+            return redirect
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -619,14 +590,9 @@ async def opds_library(
     try:
         auth_username, token, display_name = auth_info
 
-        # Ensure this is the authenticated user's feed or authentication is disabled
-        if AUTH_ENABLED and auth_username and username != display_name:
-            # Preserve query parameters in the redirect
-            params_str = "&".join([f"{k}={v}" for k, v in request.query_params.items()])
-            redirect_url = f"/opds/{display_name}/libraries/{library_id}/items"
-            if params_str:
-                redirect_url += f"?{params_str}"
-            return RedirectResponse(url=redirect_url)
+        redirect = _canonical_user_redirect(request, username, auth_info)
+        if redirect:
+            return redirect
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -655,6 +621,7 @@ async def opds_library(
 @app.get("/opds/{username}/libraries/{library_id}/series")
 async def opds_series(
     username: str,
+    request: Request,
     library_id: str,
     auth_info: tuple = Depends(get_authenticated_user)
 ):
@@ -671,9 +638,9 @@ async def opds_series(
     try:
         auth_username, token, display_name = auth_info
 
-        # Ensure this is the authenticated user's feed or authentication is disabled
-        if AUTH_ENABLED and auth_username and username != display_name:
-            return RedirectResponse(url=f"/opds/{display_name}/libraries/{library_id}/series")
+        redirect = _canonical_user_redirect(request, username, auth_info)
+        if redirect:
+            return redirect
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -695,6 +662,7 @@ async def opds_series(
 @app.get("/opds/{username}/libraries/{library_id}/series/{series_id}")
 async def opds_series_items(
     username: str,
+    request: Request,
     library_id: str,
     series_id: str,
     auth_info: tuple = Depends(get_authenticated_user)
@@ -722,9 +690,9 @@ async def opds_series_items(
     try:
         auth_username, token, display_name = auth_info
 
-        # Ensure this is the authenticated user's feed or authentication is disabled
-        if AUTH_ENABLED and auth_username and username != display_name:
-            return RedirectResponse(url=f"/opds/{display_name}/libraries/{library_id}/series/{series_id}")
+        redirect = _canonical_user_redirect(request, username, auth_info)
+        if redirect:
+            return redirect
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -747,6 +715,7 @@ async def opds_series_items(
 @app.get("/opds/{username}/libraries/{library_id}/collections")
 async def opds_collections(
     username: str,
+    request: Request,
     library_id: str,
     auth_info: tuple = Depends(get_authenticated_user)
 ):
@@ -763,9 +732,9 @@ async def opds_collections(
     try:
         auth_username, token, display_name = auth_info
 
-        # Ensure this is the authenticated user's feed or authentication is disabled
-        if AUTH_ENABLED and auth_username and username != display_name:
-            return RedirectResponse(url=f"/opds/{display_name}/libraries/{library_id}/collections")
+        redirect = _canonical_user_redirect(request, username, auth_info)
+        if redirect:
+            return redirect
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -810,16 +779,9 @@ async def opds_collection_items(
     try:
         auth_username, token, display_name = auth_info
 
-        # Ensure this is the authenticated user's feed or authentication is disabled
-        if AUTH_ENABLED and auth_username and username != display_name:
-            # Preserve query parameters in the redirect
-            params_str = "&".join([f"{k}={v}" for k, v in request.query_params.items()])
-            redirect_url = (
-                f"/opds/{display_name}/libraries/{library_id}/collections/{collection_id}"
-            )
-            if params_str:
-                redirect_url += f"?{params_str}"
-            return RedirectResponse(url=redirect_url)
+        redirect = _canonical_user_redirect(request, username, auth_info)
+        if redirect:
+            return redirect
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -864,14 +826,9 @@ async def opds_authors(
     try:
         auth_username, token, display_name = auth_info
 
-        # Ensure this is the authenticated user's feed or authentication is disabled
-        if AUTH_ENABLED and auth_username and username != display_name:
-            # Preserve query parameters in the redirect
-            params_str = "&".join([f"{k}={v}" for k, v in request.query_params.items()])
-            redirect_url = f"/opds/{display_name}/libraries/{library_id}/authors"
-            if params_str:
-                redirect_url += f"?{params_str}"
-            return RedirectResponse(url=redirect_url)
+        redirect = _canonical_user_redirect(request, username, auth_info)
+        if redirect:
+            return redirect
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -917,14 +874,9 @@ async def opds_author_items(
     try:
         auth_username, token, display_name = auth_info
 
-        # Ensure this is the authenticated user's feed or authentication is disabled
-        if AUTH_ENABLED and auth_username and username != display_name:
-            # Preserve query parameters in the redirect
-            params_str = "&".join([f"{k}={v}" for k, v in request.query_params.items()])
-            redirect_url = f"/opds/{display_name}/libraries/{library_id}/authors/{author_id}"
-            if params_str:
-                redirect_url += f"?{params_str}"
-            return RedirectResponse(url=redirect_url)
+        redirect = _canonical_user_redirect(request, username, auth_info)
+        if redirect:
+            return redirect
 
         # Use the display name from authentication if available
         effective_username = display_name if auth_username else username
@@ -946,7 +898,7 @@ async def opds_author_items(
 
 
 @app.get("/admin/cache/stats")
-async def get_cache_stats(auth_info: tuple = Depends(require_auth)):
+async def get_cache_stats(auth_info: tuple = Depends(get_authenticated_user)):
     """Get statistics about the cache.
 
     Returns:
@@ -988,7 +940,7 @@ async def get_cache_stats(auth_info: tuple = Depends(require_auth)):
 
 
 @app.post("/admin/cache/clear")
-async def clear_all_cache(auth_info: tuple = Depends(require_auth)):
+async def clear_all_cache(auth_info: tuple = Depends(get_authenticated_user)):
     """Clear all items in the cache.
 
     Returns:
@@ -1007,7 +959,7 @@ async def clear_all_cache(auth_info: tuple = Depends(require_auth)):
 async def invalidate_specific_cache(
     endpoint: str = None,
     username: str = None,
-    auth_info: tuple = Depends(require_auth)
+    auth_info: tuple = Depends(get_authenticated_user)
 ):
     """Invalidate cache for a specific endpoint.
 
@@ -1038,108 +990,92 @@ async def invalidate_specific_cache(
         raise CacheError(f"Failed to invalidate cache for {endpoint}") from e
 
 
+_ABS_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _content_disposition(upstream_value: str, fallback: str) -> str:
+    """Build a Content-Disposition that survives non-ASCII filenames.
+
+    HTTP headers are latin-1 on the wire, so passing ABS's header through with a
+    filename like "Märchen.epub" raised UnicodeEncodeError and the download
+    500ed. Emit an ASCII ``filename`` fallback plus RFC 5987 ``filename*``.
+    """
+    name = None
+    star = re.search(r"filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)", upstream_value or "")
+    if star:
+        name = unquote(star.group(1).strip())
+    else:
+        plain = re.search(r'filename\s*=\s*"?([^";]+)"?', upstream_value or "")
+        if plain:
+            name = plain.group(1).strip()
+    name = name or fallback
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    ascii_name = re.sub(r'["\\\r\n]', "", ascii_name).strip() or fallback
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name, safe='')}"
+
+
 @app.get("/opds/proxy/download/{item_id}/file/{file_ino}")
 async def proxy_download(
     item_id: str,
     file_ino: str,
-    request: Request,
     auth_info: tuple = Depends(get_authenticated_user)
 ):
-    """Proxy file downloads from Audiobookshelf to handle authentication properly.
+    """Stream an ebook file from Audiobookshelf using the caller's ABS token.
 
-    This solves the authentication issue when clicking download links by:
-    1. Receiving the download request from the OPDS client
-    2. Adding proper authentication to the upstream request to Audiobookshelf
-    3. Streaming the file content back to the client
+    Acquisition links point here so clients only ever hold their OPDS (Basic)
+    credentials, never an ABS token.
 
-    Args:
-        item_id: The ID of the item to download
-        file_ino: The inode number of the file to download
-        request: The FastAPI request object
-        auth_info: The authentication info tuple
-
-    Returns:
-        StreamingResponse: The file content stream
+    One upstream GET whose status is checked BEFORE the response starts: errors
+    raised from inside a streaming body arrive after a 200 has been sent and
+    show up on the reader as a truncated or corrupt book.
     """
-    from fastapi.responses import StreamingResponse
-    import aiohttp
+    if not (_ABS_ID_RE.match(item_id) and _ABS_ID_RE.match(file_ino)):
+        raise HTTPException(status_code=404, detail="Not found")
 
-    username, token, display_name = auth_info
-
-    if not token:
-        # Log at debug level instead of error since this is expected behavior
-        # for OPDS clients which try without auth first
-        logger.debug("Authentication challenge for download of item %s", item_id)
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required for downloads",
-            headers={"WWW-Authenticate": "Basic realm=\"OPDS-ABS\""}
-        )
-
-    logger.debug("Proxying download for item %s, file %s", item_id, file_ino)
-
-    # Construct the URL for the file download on the Audiobookshelf API
+    username, token, _ = auth_info
     url = f"{AUDIOBOOKSHELF_API}/items/{item_id}/file/{file_ino}/download"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
 
-    # Set up proper authentication headers
-    headers = {"Authorization": f"Bearer {token}"}
-    logger.debug("Making authenticated request to %s", url)
-
-    async def stream_file():
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(url, headers=headers) as response:
-                    response.raise_for_status()
-                    logger.debug("Received successful response from Audiobookshelf API with status %s", response.status)
-
-                    # Stream the response content
-                    async for chunk in response.content.iter_any():
-                        yield chunk
-
-            except aiohttp.ClientResponseError as e:
-                logger.error("Error proxying download: %s - %s", e.status, str(e))
-                # Re-raise as HTTPException with appropriate status
-                raise HTTPException(status_code=e.status, detail=f"Error fetching file: {str(e)}")
-            except Exception as e:
-                logger.error("Unexpected error proxying download: %s", str(e))
-                raise HTTPException(status_code=500, detail=f"Error downloading file: {str(e)}")
-
+    session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=60))
     try:
-        # Make a HEAD request first to get content headers without downloading the file
-        response_headers = {}
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.head(url, headers=headers) as head_response:
-                    head_response.raise_for_status()
+        upstream = await session.get(url, headers=headers)
+    except (aiohttp.ClientError, TimeoutError) as e:
+        await session.close()
+        logger.error("Download item=%s file=%s: cannot reach Audiobookshelf: %s", item_id, file_ino, e)
+        raise HTTPException(status_code=503, detail="Audiobookshelf server is unavailable") from None
 
-                    # Get content type for proper MIME type handling
-                    content_type = head_response.headers.get("Content-Type", "application/octet-stream")
+    if upstream.status != 200:
+        upstream.release()
+        await session.close()
+        logger.warning("Download item=%s file=%s user=%s: Audiobookshelf returned HTTP %d",
+                       item_id, file_ino, username, upstream.status)
+        if upstream.status in (401, 403):
+            if token:
+                invalidate_token(token)
+            raise HTTPException(status_code=401, detail="Authentication required",
+                                headers=CHALLENGE_HEADERS)
+        if upstream.status == 404:
+            raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=502, detail="Audiobookshelf download failed")
 
-                    # Set the same headers we received from Audiobookshelf
-                    for header_name, header_value in head_response.headers.items():
-                        if header_name.lower() in ("content-type", "content-disposition", "content-length"):
-                            response_headers[header_name] = header_value
+    response_headers = {
+        "Content-Disposition": _content_disposition(
+            upstream.headers.get("Content-Disposition", ""), f"book-{item_id}.epub"),
+    }
+    if upstream.headers.get("Content-Length"):
+        response_headers["Content-Length"] = upstream.headers["Content-Length"]
+    media_type = upstream.headers.get("Content-Type", "application/octet-stream")
+    logger.info("Download item=%s file=%s user=%s type=%s bytes=%s",
+                item_id, file_ino, username, media_type,
+                upstream.headers.get("Content-Length", "?"))
 
-                    logger.debug("Proxying download with content type: %s", content_type)
+    async def body():
+        try:
+            async for chunk in upstream.content.iter_chunked(64 * 1024):
+                yield chunk
+        finally:
+            upstream.release()
+            await session.close()
 
-                    # Make sure we have a content-disposition header for proper filename
-                    if "content-disposition" not in {k.lower(): v for k, v in response_headers.items()}:
-                        filename = f"book-{item_id}.epub"
-                        response_headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-            except Exception as e:
-                logger.warning("Error making HEAD request, continuing without headers: %s", str(e))
-                # If HEAD request fails, we'll continue without the headers
-                content_type = "application/octet-stream"
-                response_headers = {}
-
-        # Return a streaming response with the file content and appropriate headers
-        return StreamingResponse(
-            stream_file(),
-            media_type=content_type,
-            headers=response_headers
-        )
-
-    except Exception as e:
-        logger.error("Error setting up download proxy: %s", str(e))
-        raise HTTPException(status_code=500, detail=f"Failed to set up download: {str(e)}")
+    return StreamingResponse(body(), media_type=media_type, headers=response_headers)

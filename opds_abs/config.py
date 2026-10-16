@@ -57,3 +57,12 @@ ITEMS_PER_PAGE = int(os.getenv("ITEMS_PER_PAGE", "25"))  # Default: 25 items per
 
 # Logging configuration
 LOG_LEVEL = os.environ.get("OPDS_LOG_LEVEL", "INFO").upper()
+# "timestamped" (default) or "plain" (no timestamp, for collectors that add their own)
+LOG_FORMAT = os.environ.get("OPDS_LOG_FORMAT", "timestamped").lower()
+
+# Server configuration
+# Proxies whose X-Forwarded-Proto/For headers are trusted. Behind a reverse proxy the
+# OpenSearch description must advertise the public https URL, which needs these.
+FORWARDED_ALLOW_IPS = os.environ.get("FORWARDED_ALLOW_IPS", "*")
+# Development only: restart the server when source files change.
+DEV_RELOAD = os.environ.get("DEV_RELOAD", "false").lower() == "true"

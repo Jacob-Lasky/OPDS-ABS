@@ -438,10 +438,7 @@ class SeriesFeedGenerator(BaseFeedGenerator):
         # Use the direct series route instead of query parameters
         series_id = series.get('id')
 
-        # Add token to the series link if provided
         series_link = f"/opds/{username}/libraries/{library_id}/series/{series_id}"
-        if token:
-            series_link = f"{series_link}?token={token}"
 
         # Create entry data structure
         entry_data = {

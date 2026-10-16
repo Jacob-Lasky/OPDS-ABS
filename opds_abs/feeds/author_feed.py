@@ -285,10 +285,6 @@ class AuthorFeedGenerator(BaseFeedGenerator):
             # Create the base URL for the author's books
             author_url = f"/opds/{username}/libraries/{library_id}/authors/{author_id}"
 
-            # Add token to URL if provided
-            if token:
-                author_url += f"?token={token}"
-
             # Create the entry data structure
             entry_data = {
                 "entry": {

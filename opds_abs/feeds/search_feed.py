@@ -12,7 +12,6 @@ from opds_abs.feeds.author_feed import AuthorFeedGenerator
 from opds_abs.feeds.series_feed import SeriesFeedGenerator
 from opds_abs.utils import dict_to_xml
 from opds_abs.utils.cache_utils import get_cached_library_items, get_cached_search_results
-from opds_abs.utils.auth_utils import get_token_for_username
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -111,19 +110,9 @@ class SearchFeedGenerator(BaseFeedGenerator):
         params = params or {}
         query = params.get("q", "")
 
-        # Check if token is in the query params (for OPDS clients that pass it that way)
-        if not token and params.get("token"):
-            token = params.get("token")
-
-        # Try to get cached token if none was provided
-        if not token and username:
-            cached_token = get_token_for_username(username)
-            if cached_token:
-                token = cached_token
-                logger.debug("Retrieved cached token for user %s", username)
-
         # Return empty search results if no query provided
         if not query:
+            logger.info("Search with empty query from user=%s", username)
             return self._create_empty_search_feed(username, library_id, query)
 
         # Get search data and library items from cache or API
@@ -145,6 +134,10 @@ class SearchFeedGenerator(BaseFeedGenerator):
         await self._process_series(feed, search_data, username, library_id, cached_library_items, token)
         await self._process_authors(feed, search_data, username, library_id, cached_library_items, token)
 
+        logger.info(
+            "Search q=%r user=%s: ABS matched %d books, %d series, %d authors; feed has %d entries",
+            query, username, len(search_data.get("book", [])), len(search_data.get("series", [])),
+            len(search_data.get("authors", [])), len(feed.findall("entry")))
         return self.create_response(feed)
 
 

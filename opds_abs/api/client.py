@@ -23,7 +23,7 @@ from opds_abs.config import (
 )
 from opds_abs.utils.cache_utils import _create_cache_key, cache_get, cache_set, cached, _cache
 from opds_abs.utils.error_utils import AuthenticationError, APIClientError, log_error
-from opds_abs.utils.auth_utils import get_token_for_username, TOKEN_CACHE
+from opds_abs.utils.auth_utils import invalidate_token
 
 logger = logging.getLogger(__name__)
 
@@ -64,25 +64,10 @@ async def fetch_from_api(
     """
     params = params.copy() if params else {}
 
-    # Try to get a token if one wasn't provided
-    if token is None and username is not None:
-        # Check if token is in the params
-        if 'token' in params:
-            token = params.pop('token')  # Extract and remove from params
-            logger.debug("Using token from params for user %s", username)
-        # Check if api_key is in the params
-        elif 'api_key' in params:
-            token = params.pop('api_key')  # Use API key as token
-            logger.debug("Using API key from params for user %s", username)
-        else:
-            # Try to get from the TOKEN_CACHE
-            token = get_token_for_username(username)
-            logger.debug("Token from cache for user %s: %s", username, 'Found' if token else 'Not found')
-
-        # If no token from cache and authentication is enabled, we have a problem
-        if token is None and AUTH_ENABLED:
-            logger.error("No cached token available for user %s", username)
-            raise AuthenticationError("No authentication token available for user %s" % username)
+    # The token always comes from the authenticated request. DO NOT look one up by
+    # username: that fallback served users' catalogs to anonymous callers (#1).
+    if token is None and AUTH_ENABLED:
+        raise AuthenticationError("No authentication token for API call to %s" % endpoint)
 
     # If authentication is disabled, proceed without a token
     if not AUTH_ENABLED:
@@ -150,10 +135,9 @@ async def fetch_from_api(
                     token_info = "Token present" if token else "No token"
                     logger.error("Authentication error (%s) for %s: %s", token_info, url, str(resp_error))
 
-                    # Invalidate token cache on auth errors to force re-authentication
-                    if username and username in TOKEN_CACHE:
-                        del TOKEN_CACHE[username]
-                        logger.debug("Invalidated token cache for %s due to auth error", username)
+                    # Forget the token so the next request re-authenticates
+                    if token:
+                        invalidate_token(token)
 
                     raise AuthenticationError(
                         f"Authentication failed for Audiobookshelf API: {str(resp_error)}"
@@ -214,16 +198,10 @@ async def get_download_urls_from_item(
             - ino: The inode number of the file
             - filename: The filename of the ebook
             - download_url: An empty string (filled in later)
-            - token: The token used for authentication
     """
     try:
         # Log authentication information for debugging
         logger.debug("Getting download URLs for item %s, username: %s, token present: %s", item_id, username, token is not None)
-
-        if token is None and username:
-            cached_token = get_token_for_username(username)
-            token = cached_token  # Use the cached token if available
-            logger.debug("No token provided for download, using cached token: %s", cached_token is not None)
 
         item = await fetch_from_api(f"/items/{item_id}", username=username, token=token)
         ebook_inos = []
@@ -233,7 +211,6 @@ async def get_download_urls_from_item(
                     "ino":          file.get("ino"),
                     "filename":     file.get("metadata", {}).get("filename", ""),
                     "download_url": "",
-                    "token":        token  # Store the token with the file info
                 }
                 ebook_inos.append(file_info)
                 logger.debug("Found ebook file: %s (ino: %s)", file_info['filename'], file_info['ino'])

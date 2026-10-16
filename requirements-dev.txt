@@ -1,6 +1,6 @@
 -r requirements.txt
-pylint
+pytest==9.1.1
+httpx2==2.13.1
 pydocstyle
 flake8
 flake8-docstrings
-pre-commit
