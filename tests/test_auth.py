@@ -49,3 +49,26 @@ def test_feeds_never_embed_tokens(client):
         body = client.get(path, auth=ALICE).text
         assert "tok-alice" not in body, path
         assert "token=" not in body, path
+
+
+def test_abs_login_rate_limit_is_503_not_wrong_password(client):
+    """A 429/5xx from ABS /login did not judge the password; do not tell the reader it was wrong."""
+    r = client.get(FEED, auth=("ratelimited", "pw"))
+    assert r.status_code == 503
+    assert "www-authenticate" not in r.headers
+
+
+def test_concurrent_first_requests_log_in_once(fake_abs, client):
+    import asyncio
+
+    from opds_abs.utils import auth_utils
+
+    creds = auth_utils.Credentials("basic", "alice", "alice-pw")
+
+    async def burst():
+        return await asyncio.gather(*(auth_utils.authenticate(creds) for _ in range(5)))
+
+    results = asyncio.run(burst())
+    assert {r[1] for r in results} == {"tok-alice"}
+    assert fake_abs.logins == ["alice"]
+    assert auth_utils._LOGIN_LOCKS == {}

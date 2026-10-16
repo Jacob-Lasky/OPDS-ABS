@@ -66,6 +66,8 @@ class FakeABS:
     async def login(self, request):
         body = await request.json()
         self.logins.append(body["username"])
+        if body["username"] == "ratelimited":
+            return web.Response(status=429, text="Too many requests")
         if USERS.get(body["username"]) != body["password"]:
             return web.Response(status=401, text="Unauthorized")
         u = body["username"]

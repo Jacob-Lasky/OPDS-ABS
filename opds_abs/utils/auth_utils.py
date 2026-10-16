@@ -27,6 +27,7 @@ SECURITY INVARIANTS (each one closed a real hole, see Jacob-Lasky/opds-abs#1):
   only; a restart costs one ``/login`` per client.
 - DO NOT log secrets, tokens, or ABS response bodies (they contain tokens).
 """
+import asyncio
 import base64
 import hashlib
 import logging
@@ -69,6 +70,9 @@ class Credentials:
         raw = f"{self.scheme}\0{self.username or ''}\0{self.secret}".encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
+
+# cache_key -> lock serialising the upstream login for one set of credentials
+_LOGIN_LOCKS: Dict[str, asyncio.Lock] = {}
 
 # cache_key -> (token, abs_username, abs_user_type, expires_at)
 _TOKEN_CACHE: Dict[str, Tuple[str, str, str, float]] = {}
@@ -150,7 +154,9 @@ async def _abs_login(session: aiohttp.ClientSession, username: str, password: st
         if response.status in (401, 403):
             return None
         if response.status != 200:
-            raise AuthenticationError(f"Audiobookshelf /login returned HTTP {response.status}")
+            # 429 (ABS login rate limit), 5xx: the password was not judged, so
+            # DO NOT answer the reader with "wrong password".
+            raise AbsUnavailableError(f"Audiobookshelf /login returned HTTP {response.status}")
         user = (await response.json()).get("user") or {}
     # Prefer the legacy non-expiring token; ABS >= 2.26 also returns an expiring
     # accessToken, which works until it expires and then forces a re-login.
@@ -173,7 +179,7 @@ async def _abs_authorize_api_key(session: aiohttp.ClientSession, api_key: str) -
         if response.status in (401, 403):
             return None
         if response.status != 200:
-            raise AuthenticationError(f"Audiobookshelf /api/authorize returned HTTP {response.status}")
+            raise AbsUnavailableError(f"Audiobookshelf /api/authorize returned HTTP {response.status}")
         user = (await response.json()).get("user") or {}
     if not user.get("username"):
         raise AuthenticationError("Audiobookshelf /api/authorize response contained no user")
@@ -194,6 +200,23 @@ async def authenticate(creds: Credentials) -> Tuple[str, str, str, str]:
         token, abs_username, user_type = cached
         return abs_username, token, user_type, "cache"
 
+    # Readers fire several requests at once on open; without this each one
+    # logged in separately, and every ABS /login creates a session row.
+    key = creds.cache_key()
+    try:
+        async with _LOGIN_LOCKS.setdefault(key, asyncio.Lock()):
+            cached = _cache_get(creds)
+            if cached:
+                token, abs_username, user_type = cached
+                return abs_username, token, user_type, "cache"
+            return await _authenticate_upstream(creds)
+    finally:
+        # Waiters keep their reference; dropping it here keeps the dict from
+        # growing with every distinct (e.g. wrong) password ever tried.
+        _LOGIN_LOCKS.pop(key, None)
+
+
+async def _authenticate_upstream(creds: Credentials) -> Tuple[str, str, str, str]:
     try:
         async with aiohttp.ClientSession(timeout=_ABS_TIMEOUT) as session:
             result = None

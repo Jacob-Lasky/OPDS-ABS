@@ -215,9 +215,11 @@ def _canonical_user_redirect(request: Request, username: str, auth_info: tuple):
     auth_username, _, display_name = auth_info
     if not (AUTH_ENABLED and auth_username) or username == display_name:
         return None
-    segments = request.url.path.split("/")
-    segments[2] = display_name  # ["", "opds", <username>, ...]
-    url = "/".join(quote(seg, safe="") for seg in segments)
+    # Split the RAW path so encoded characters in other segments stay encoded.
+    raw_path = request.scope.get("raw_path", b"").decode("latin-1") or quote(request.url.path)
+    segments = raw_path.split("/")
+    segments[2] = quote(display_name, safe="")  # ["", "opds", <username>, ...]
+    url = "/".join(segments)
     if request.url.query:
         url += f"?{request.url.query}"
     return RedirectResponse(url=url)
@@ -271,8 +273,10 @@ async def search_xml(username: str, library_id: str, request: Request):
     No auth dependency: the document holds nothing that is not already in the URL,
     and some clients fetch it without sending credentials.
     """
-    search_url = request.url_for(
-        "opds_search", username=username, library_id=library_id)
+    # Built by hand: url_for does not percent-encode path params, so a username
+    # with a space or "?" produced a template that split at the wrong place.
+    search_url = (f"{request.base_url}opds/{quote(username, safe='')}"
+                  f"/libraries/{quote(library_id, safe='')}/search")
     osd = etree.Element(
         "OpenSearchDescription", nsmap={None: "http://a9.com/-/spec/opensearch/1.1/"})
     for tag, text in (

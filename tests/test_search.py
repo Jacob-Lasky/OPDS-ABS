@@ -57,3 +57,14 @@ def test_search_with_markup_in_titles_is_well_formed(client):
     r = client.get(f"/opds/alice/libraries/{LIB}/search?q=ampersand", auth=ALICE)
     feed = etree.fromstring(r.content)
     assert [e for e in feed.iter("{*}entry")]
+
+
+def test_description_template_encodes_odd_usernames(client):
+    r = client.get(f"/opds/a%20b%3Fc/libraries/{LIB}/search.xml")
+    template = etree.fromstring(r.content).find(f"{OSD_NS}Url").get("template")
+    assert template == f"http://testserver/opds/a%20b%3Fc/libraries/{LIB}/search?q={{searchTerms}}"
+
+
+def test_redirect_keeps_other_segments_encoded(client):
+    r = client.get("/opds/ALICE/libraries/a%20b/items", auth=ALICE, follow_redirects=False)
+    assert r.headers["location"] == "/opds/alice/libraries/a%20b/items"
