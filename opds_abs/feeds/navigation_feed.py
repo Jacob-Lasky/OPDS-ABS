@@ -5,7 +5,6 @@ import logging
 # Local application imports
 from opds_abs.core.feed_generator import BaseFeedGenerator
 from opds_abs.core.navigation import navigation
-from opds_abs.config import ITEMS_PER_PAGE, PAGINATION_ENABLED
 from opds_abs.utils import dict_to_xml
 
 # Set up logging
@@ -61,29 +60,6 @@ class NavigationFeedGenerator(BaseFeedGenerator):
 
         Returns:
             Response: A FastAPI response object containing the XML feed.
-
-        Example:
-            ```python
-            # In a FastAPI route handler:
-            @app.get("/opds/{username}/libraries/{library_id}")
-            async def opds_nav(
-                username: str,
-                library_id: str,
-                auth_info: tuple = Depends(get_authenticated_user)
-            ):
-                # Extract authentication info
-                auth_username, token, display_name = auth_info
-
-                # Create navigation feed generator
-                nav_feed = NavigationFeedGenerator()
-
-                # Generate the navigation feed
-                return await nav_feed.generate_navigation_feed(
-                    username=display_name,
-                    library_id=library_id,
-                    token=token
-                )
-            ```
         """
         try:
             # Log the request
@@ -120,12 +96,7 @@ class NavigationFeedGenerator(BaseFeedGenerator):
                 base_path = f"/opds/{username}/libraries/{library_id}/"
                 nav_params = nav.get('params','')
 
-                # Add authentication token to nav_params if available
-                if token and nav_params:
-                    nav_href = f"{base_path}{nav.get('path','')}?{nav_params}&token={token}"
-                elif token:
-                    nav_href = f"{base_path}{nav.get('path','')}?token={token}"
-                elif nav_params:
+                if nav_params:
                     nav_href = f"{base_path}{nav.get('path','')}?{nav_params}"
                 else:
                     nav_href = f"{base_path}{nav.get('path','')}"

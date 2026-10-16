@@ -1,5 +1,6 @@
 """Search feed generator."""
 # Standard library imports
+import asyncio
 import logging
 from collections import defaultdict
 
@@ -7,12 +8,11 @@ from collections import defaultdict
 # Local application imports
 from opds_abs.core.feed_generator import BaseFeedGenerator
 from opds_abs.api.client import fetch_from_api, get_download_urls_from_item
-from opds_abs.config import ITEMS_PER_PAGE, PAGINATION_ENABLED
 from opds_abs.feeds.author_feed import AuthorFeedGenerator
 from opds_abs.feeds.series_feed import SeriesFeedGenerator
 from opds_abs.utils import dict_to_xml
+from opds_abs.utils.items import has_ebook
 from opds_abs.utils.cache_utils import get_cached_library_items, get_cached_search_results
-from opds_abs.utils.auth_utils import get_token_for_username
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -71,59 +71,13 @@ class SearchFeedGenerator(BaseFeedGenerator):
 
         Returns:
             Response: The search results feed containing matching books, series, and authors.
-
-        Example:
-            ```python
-            # In a FastAPI route handler:
-            @app.get("/opds/{username}/libraries/{library_id}/search")
-            async def opds_search(
-                username: str,
-                library_id: str,
-                request: Request,
-                auth_info: tuple = Depends(get_authenticated_user)
-            ):
-                try:
-                    auth_username, token, display_name = auth_info
-
-                    # Get query parameters from the request
-                    params = dict(request.query_params)
-
-                    # Use appropriate username based on authentication
-                    effective_username = display_name if auth_username else username
-
-                    # Initialize the search feed generator
-                    search_feed = SearchFeedGenerator()
-
-                    # Generate and return the search results feed
-                    return await search_feed.generate_search_feed(
-                        effective_username,
-                        library_id,
-                        params,
-                        token=token
-                    )
-                except Exception as e:
-                    # Handle exceptions appropriately
-                    context = f"Searching in library {library_id} for user {username}"
-                    log_error(e, context=context)
-                    return handle_exception(e, context=context)
-            ```
         """
         params = params or {}
         query = params.get("q", "")
 
-        # Check if token is in the query params (for OPDS clients that pass it that way)
-        if not token and params.get("token"):
-            token = params.get("token")
-
-        # Try to get cached token if none was provided
-        if not token and username:
-            cached_token = get_token_for_username(username)
-            if cached_token:
-                token = cached_token
-                logger.debug("Retrieved cached token for user %s", username)
-
         # Return empty search results if no query provided
         if not query:
+            logger.info("Search with empty query from user=%s", username)
             return self._create_empty_search_feed(username, library_id, query)
 
         # Get search data and library items from cache or API
@@ -145,6 +99,10 @@ class SearchFeedGenerator(BaseFeedGenerator):
         await self._process_series(feed, search_data, username, library_id, cached_library_items, token)
         await self._process_authors(feed, search_data, username, library_id, cached_library_items, token)
 
+        logger.info(
+            "Search q=%r user=%s: ABS matched %d books, %d series, %d authors; feed has %d entries",
+            query, username, len(search_data.get("book", [])), len(search_data.get("series", [])),
+            len(search_data.get("authors", [])), len(feed.findall("entry")))
         return self.create_response(feed)
 
 
@@ -208,54 +166,24 @@ class SearchFeedGenerator(BaseFeedGenerator):
         # Create a mapping of book IDs to their full library item data
         book_id_map = {item.get('id'): item for item in cached_library_items if item.get('id')}
 
-        for book_result in book_results:
-            await self._process_single_book(feed, book_result, username, book_id_map, token)
+        books = [self._resolve_book(r, book_id_map) for r in book_results]
+        books = [b for b in books if b]
+        # Fetch every hit's ebook files concurrently; entries keep ABS's ranking.
+        ebook_inos_list = await asyncio.gather(
+            *(get_download_urls_from_item(b["id"], username=username, token=token) for b in books))
+        for lib_item, ebook_inos in zip(books, ebook_inos_list):
+            self.add_book_to_feed(feed, lib_item, ebook_inos, "", token=token)
 
-    async def _process_single_book(self, feed, book_result, username, book_id_map, token=None):
-        """Process a single book and add it to the feed if it has an ebook.
+    def _resolve_book(self, book_result, book_id_map):
+        """Return the full library item for a search hit, or None if it has no ebook.
 
-        Args:
-            feed: The XML feed object to add the book entry to.
-            book_result: Dictionary containing the book search result data.
-            username: String representing the authenticated user's username.
-            book_id_map: Dictionary mapping book IDs to their complete metadata.
-            token: Optional authentication token for Audiobookshelf.
-
-        Returns:
-            None. The book is added directly to the feed if it meets criteria.
-
-        Note:
-            Books without ebook files are skipped.
+        Prefers the cached all-items entry, which carries complete metadata.
         """
-        if "libraryItem" not in book_result:
-            return
-
-        lib_item = book_result.get("libraryItem", {})
+        lib_item = book_result.get("libraryItem") or {}
         book_id = lib_item.get("id")
-
-        if not book_id or not self._has_ebook_file(lib_item):
-            return
-
-        # Look up the book in our cache for complete metadata
-        cached_item = book_id_map.get(book_id)
-        if cached_item:
-            # Use the cached item which has complete metadata including author information
-            lib_item = cached_item
-
-        ebook_inos = await get_download_urls_from_item(book_id, username=username, token=token)
-        self.add_book_to_feed(feed, lib_item, ebook_inos, "", token=token)
-
-    def _has_ebook_file(self, lib_item):
-        """Check if a library item has an ebook file.
-
-        Args:
-            lib_item: Dictionary containing library item metadata from Audiobookshelf API.
-
-        Returns:
-            bool: True if the item has an ebook file or format, False otherwise.
-        """
-        media = lib_item.get("media", {})
-        return bool(media.get("ebookFile", media.get("ebookFormat", None)))
+        if not book_id or not has_ebook(lib_item):
+            return None
+        return book_id_map.get(book_id) or lib_item
 
     async def _process_series(self, feed, search_data, username, library_id, cached_library_items, token=None):
         """Process series search results and add them to the feed.
@@ -308,7 +236,7 @@ class SearchFeedGenerator(BaseFeedGenerator):
             series_data = series_result.get('series', {})
             books_with_ebooks = [
                 book for book in series_result.get('books', [])
-                if self._has_ebook_file(book)
+                if has_ebook(book)
             ]
 
             # If this series has books with ebooks, add it to our list to process later
@@ -528,7 +456,7 @@ class SearchFeedGenerator(BaseFeedGenerator):
         for item in cached_library_items:
             author_name = item.get("media", {}).get("metadata", {}).get("authorName")
             if author_name and author_name in search_author_names:
-                if self._has_ebook_file(item):
+                if has_ebook(item):
                     author_ebook_counts[author_name] += 1
 
         return author_ebook_counts

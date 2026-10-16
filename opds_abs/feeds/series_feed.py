@@ -6,13 +6,31 @@ import asyncio
 # Local application imports
 from opds_abs.core.feed_generator import BaseFeedGenerator
 from opds_abs.api.client import fetch_from_api, get_download_urls_from_item
-from opds_abs.config import AUDIOBOOKSHELF_API, ITEMS_PER_PAGE, PAGINATION_ENABLED
+from opds_abs.config import AUDIOBOOKSHELF_EXTERNAL_API
 from opds_abs.utils import dict_to_xml
+from opds_abs.utils.items import has_ebook
 from opds_abs.utils.cache_utils import get_cached_library_items, get_cached_series_details
-from opds_abs.utils.error_utils import log_error, handle_exception
+from opds_abs.utils.error_utils import FeedGenerationError, OPDSBaseException
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+def series_sequence_key(item):
+    """Sort key for a book's position in its series.
+
+    ABS sequences are free text: "2", "1.5", "", None, "Book 3". Numeric ones sort
+    numerically, everything else after them in text order. DO NOT float() the raw
+    value: one unnumbered book made the whole series feed a 500.
+    """
+    series = item.get('media', {}).get('metadata', {}).get('series') or {}
+    if isinstance(series, list):
+        series = series[0] if series else {}
+    sequence = str(series.get('sequence') or '').strip()
+    try:
+        return (0, float(sequence), "")
+    except ValueError:
+        return (1, 0.0, sequence.lower())
+
 
 class SeriesFeedGenerator(BaseFeedGenerator):
     """Generator for series feed.
@@ -73,184 +91,6 @@ class SeriesFeedGenerator(BaseFeedGenerator):
 
         return most_common_author[0]
 
-    async def get_series_details(self, username, library_id, series_id, token=None):
-        """Fetch detailed information about a specific series.
-
-        Args:
-            username (str): The username of the authenticated user.
-            library_id (str): ID of the library containing the series.
-            series_id (str): ID of the series to get details for.
-            token (str, optional): Authentication token for Audiobookshelf.
-
-        Returns:
-            dict: Series details or None if not found.
-        """
-        try:
-            # First get all series to find the one we want
-            series_params = {"limit": 2000, "sort": "name"}
-            data = await fetch_from_api(
-                    f"/libraries/{library_id}/series",
-                    series_params,
-                    username=username,
-                    token=token
-            )
-
-            # Find the series with the matching ID
-            for series in data.get("results", []):
-                if series.get("id") == series_id:
-                    return series
-
-            return None
-        except Exception as e:
-            logger.error("Error fetching series details: %s", e)
-            return None
-
-    async def filter_items_by_series_id(self, username, library_id, series_id, token=None):
-        """Filter items by series ID using cached items when possible.
-
-        Args:
-            username (str): The username of the authenticated user.
-            library_id (str): ID of the library containing the items.
-            series_id (str): ID of the series to filter by.
-            token (str, optional): Authentication token for Audiobookshelf.
-
-        Returns:
-            list: Library items filtered by the specified series ID.
-            dict: Series details including name and most common author.
-        """
-        try:
-            # Get series details to find the name and book IDs using the shared utility function
-            series_details = await get_cached_series_details(
-                fetch_from_api,
-                username,
-                library_id,
-                series_id,
-                token=token
-            )
-
-            if not series_details:
-                logger.warning("Could not find series details for ID %s", series_id)
-                # Fall back to API call if we couldn't find the series details
-                params = {"filter": f"series.{self.create_filter(series_id)}"}
-                data = await fetch_from_api(
-                        f"/libraries/{library_id}/items",
-                        params,
-                        username=username,
-                        token=token
-                )
-                filtered_items = self.filter_items(data)
-                # Get the most common author from the filtered items
-                most_common_author = self.get_most_common_author(filtered_items)
-                # Create minimal series details with author information
-                series_details = {
-                        "id": series_id,
-                        "name": "Unknown Series",
-                        "authorName": most_common_author
-                }
-                return filtered_items, series_details
-
-            series_name = series_details.get("name", "Unknown Series")
-            logger.debug("Found series details for: %s", series_name)
-
-            # Extract book IDs from the series details
-            series_book_ids = []
-            for book in series_details.get("books", []):
-                book_id = book.get("id")
-                if book_id:
-                    series_book_ids.append(book_id)
-
-            if not series_book_ids:
-                logger.warning("No book IDs found in series %s", series_name)
-                # Fall back to API call if we couldn't find any book IDs
-                params = {"filter": f"series.{self.create_filter(series_id)}"}
-                data = await fetch_from_api(
-                        "/libraries/{library_id}/items",
-                        params,
-                        username=username,
-                        token=token
-                )
-                filtered_items = self.filter_items(data)
-                # Get the most common author from the filtered items
-                most_common_author = self.get_most_common_author(filtered_items)
-                # Update series details with author information
-                series_details["authorName"] = most_common_author
-                return filtered_items, series_details
-
-            logger.debug("Found %d book IDs in series %s", len(series_book_ids), series_name)
-
-            # Try to get all library items from cache
-            library_items = await get_cached_library_items(
-                fetch_from_api,
-                self.filter_items,
-                username,
-                library_id,
-                token=token
-            )
-
-            # Filter the cached items by exact book ID match
-            filtered_items = []
-            for item in library_items:
-                if item.get("id") in series_book_ids:
-                    filtered_items.append(item)
-
-            logger.debug("Found %d matching items in cache for series %s", len(filtered_items), series_name)
-
-            # If no matching items were found in the cache, try the fallback method
-            if not filtered_items:
-                logger.warning("No matching items found in cache for series %s. Trying API fallback.", series_name)
-                params = {"filter": f"series.{self.create_filter(series_id)}"}
-                data = await fetch_from_api(
-                        f"/libraries/{library_id}/items",
-                        params,
-                        username=username,
-                        token=token
-                )
-                filtered_items = self.filter_items(data)
-
-            # Sort by series sequence number if available
-            sorted_items = sorted(
-                filtered_items,
-                key=lambda x: x.get('media', {}).get('metadata', {}).get('series', {}).get('sequence', 0)
-            )
-
-            # Get the most common author from the series items
-            most_common_author = self.get_most_common_author(sorted_items)
-
-            # Update series details with author information
-            series_details["authorName"] = most_common_author
-
-            logger.debug(
-                    "Final result: %d items in series %s by %s",
-                    len(sorted_items),
-                    series_name,
-                    most_common_author
-            )
-            return sorted_items, series_details
-
-        except Exception as e:
-            logger.error("Error filtering items by series: %s", e)
-            # Fall back to API call if there was an error
-            params = {
-                    "filter": f"series.{self.create_filter(series_id)}",
-                    "sort": "media.metadata.series.number"
-            }
-            data = await fetch_from_api(
-                    f"/libraries/{library_id}/items",
-                    params,
-                    username=username,
-                    token=token
-            )
-            filtered_items = self.filter_items(data)
-            # Get the most common author from the filtered items
-            most_common_author = self.get_most_common_author(filtered_items)
-            # Create minimal series details with author information
-            series_details = {
-                    "id": series_id,
-                    "name": "Unknown Series",
-                    "authorName": most_common_author
-            }
-            return filtered_items, series_details
-
     async def generate_series_items_feed(self, username, library_id, series_id, token=None):
         """Generate a feed of items in a specific series.
 
@@ -304,7 +144,7 @@ class SeriesFeedGenerator(BaseFeedGenerator):
 
             # Build the feed metadata
             feed_data = {
-                "id": {"_text": library_id},
+                "id": {"_text": f"{library_id}/series/{series_id}"},
                 "author": {
                     "name": {"_text": "OPDS Audiobookshelf"}
                 },
@@ -326,10 +166,7 @@ class SeriesFeedGenerator(BaseFeedGenerator):
 
             # Items should already be sorted by sequence when fetched from the API
             # But let's ensure they are sorted correctly just to be safe
-            sorted_library_items = sorted(
-                library_items,
-                key=lambda x: float(x.get('media', {}).get('metadata', {}).get('series', {}).get('sequence', 0))
-            )
+            sorted_library_items = sorted(library_items, key=series_sequence_key)
 
             logger.debug("Sorted %d items by sequence number for %s", len(sorted_library_items), series_name)
 
@@ -345,13 +182,10 @@ class SeriesFeedGenerator(BaseFeedGenerator):
 
             return self.create_response(feed)
 
+        except OPDSBaseException:
+            raise
         except Exception as e:
-            # Handle any unexpected errors
-            context = f"Generating series items feed for series {series_id}"
-            log_error(e, context=context)
-
-            # Use handle_exception to return a standardized error response
-            return handle_exception(e, context=context)
+            raise FeedGenerationError(f"Generating series items feed for series {series_id}" + f": {e}") from e
 
     def filter_series(self, data):
         """Find items in a library series that have an ebook file, sorted by a field.
@@ -368,7 +202,7 @@ class SeriesFeedGenerator(BaseFeedGenerator):
         for result in data.get("results", []):
             filtered_books = [
                 book for book in result.get("books", [])
-                if book.get("media", {}).get("ebookFormat") is not None
+                if has_ebook(book)
             ]
 
             if filtered_books:
@@ -390,7 +224,7 @@ class SeriesFeedGenerator(BaseFeedGenerator):
         first_book = series.get('books', [])[0] if series.get('books') else {}
         first_book_id = first_book.get("id", None)
         first_book_metadata = first_book.get('media', {}).get('metadata', {})
-        book_path = f"{AUDIOBOOKSHELF_API}/items/{first_book_id}" if first_book_id else ""
+        book_path = f"{AUDIOBOOKSHELF_EXTERNAL_API}/items/{first_book_id}" if first_book_id else ""
         cover_url = f"{book_path}/cover?format=jpeg" if book_path else ""
 
         # Determine if this was called from search feed by checking if authorName is already set
@@ -438,10 +272,7 @@ class SeriesFeedGenerator(BaseFeedGenerator):
         # Use the direct series route instead of query parameters
         series_id = series.get('id')
 
-        # Add token to the series link if provided
         series_link = f"/opds/{username}/libraries/{library_id}/series/{series_id}"
-        if token:
-            series_link = f"{series_link}?token={token}"
 
         # Create entry data structure
         entry_data = {
@@ -465,7 +296,7 @@ class SeriesFeedGenerator(BaseFeedGenerator):
                         "_attrs": {
                             "href": cover_url,
                             "rel": "http://opds-spec.org/image",
-                            "type": "image/jpeg"
+                            "type": self.image_type(cover_url)
                         }
                     }
                 ]
@@ -493,7 +324,7 @@ class SeriesFeedGenerator(BaseFeedGenerator):
 
         # Create feed metadata using dictionary approach
         feed_data = {
-            "id": {"_text": library_id},
+            "id": {"_text": f"{library_id}/series"},
             "title": {"_text": f"{username}'s series"}
         }
 

@@ -2,15 +2,17 @@
 # Standard library imports
 from base64 import b64encode
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
+import html
 
 # Third-party imports
 from lxml import etree
 from fastapi.responses import Response
 
 # Local application imports
-from opds_abs.config import AUDIOBOOKSHELF_API
+from opds_abs.config import AUDIOBOOKSHELF_EXTERNAL_API
 from opds_abs.utils import dict_to_xml
+from opds_abs.utils.items import has_ebook
 from opds_abs.utils.error_utils import FeedGenerationError, log_error
 
 # Mapping of ebook formats to correct MIME types for OPDS
@@ -114,10 +116,8 @@ class BaseFeedGenerator:
             dict_to_xml(base_feed, search_link)
 
             if current_path:
-                # Base URL parameters
-                # Check if current_path already has parameters
-                separator = "&" if "?" in current_path else "?"
-                auth_param = f"{separator}token={token}" if token else ""
+                # DO NOT append ?token= to emitted links: it leaked users' ABS
+                # tokens into access logs and client history (#1).
 
                 # Add start link
                 start_link = {
@@ -126,7 +126,7 @@ class BaseFeedGenerator:
                             "rel": "start",
                             "title": "Start Page",
                             "type": "application/atom+xml;profile=opds-catalog",
-                            "href": f"/opds/{username}/libraries/{library_id}{auth_param}"
+                            "href": f"/opds/{username}/libraries/{library_id}"
                         }
                     }
                 }
@@ -139,24 +139,11 @@ class BaseFeedGenerator:
                             "rel": "self",
                             "title": "This Page",
                             "type": "application/atom+xml;profile=opds-catalog",
-                            "href": f"/opds/{current_path}{auth_param}"
+                            "href": f"/opds/{current_path}"
                         }
                     }
                 }
                 dict_to_xml(base_feed, self_link)
-
-                # Add HTML alternate link
-                alternate_link = {
-                    "link": {
-                        "_attrs": {
-                            "rel": "alternate",
-                            "title": "HTML Page",
-                            "type": "text/html",
-                            "href": f"/opds/{current_path}{auth_param}"
-                        }
-                    }
-                }
-                dict_to_xml(base_feed, alternate_link)
 
         return base_feed
 
@@ -176,7 +163,7 @@ class BaseFeedGenerator:
                     xml_declaration=False,
                     encoding="UTF-8"
             )
-            return Response(content=feed_xml, media_type="application/atom+xml")
+            return Response(content=feed_xml, media_type="application/atom+xml;profile=opds-catalog")
         except Exception as e:
             log_error(e, context="Creating XML response")
             raise FeedGenerationError("Failed to generate XML response") from e
@@ -208,26 +195,15 @@ class BaseFeedGenerator:
             book_title = book_metadata.get("title", "Unknown Title")
             book_author = book_metadata.get("authorName", "Unknown Author")
 
-            # Check if the token was provided in the method call
-            # If not, try to get it from the ebook_inos object
-            effective_token = token
-            if not effective_token and ebook_inos and len(ebook_inos) > 0:
-                # Try to get the token from the first ebook file
-                effective_token = ebook_inos[0].get('token')
-                if effective_token:
-                    logger.debug("Using token from ebook file for book '%s'", book_title)
-
             # Log detailed information about the book and token
-            logger.debug("Adding book to feed: '%s' (ID: %s), token present: %s", book_title, book_id, effective_token is not None)
+            logger.debug("Adding book to feed: '%s' (ID: %s)", book_title, book_id)
 
             # Extract ebook format - check both direct and nested paths (for search results)
             ebook_format = media.get("ebookFormat", media.get("ebookFile", {}).get("ebookFormat"))
             logger.debug("Book '%s' format: %s", book_title, ebook_format)
 
             for ebook in ebook_inos:
-                # Use external URL for client-facing download links
-                from opds_abs.config import AUDIOBOOKSHELF_EXTERNAL_URL
-                book_path = f"{AUDIOBOOKSHELF_EXTERNAL_URL}/api/items/{book_id}"
+                book_path = f"{AUDIOBOOKSHELF_EXTERNAL_API}/items/{book_id}"
                 file_ino = ebook.get('ino')
 
                 # Use our proxy endpoint instead of direct Audiobookshelf API link
@@ -238,16 +214,22 @@ class BaseFeedGenerator:
                 # Cover URL doesn't need authentication
                 cover_url = f"{book_path}/cover?format=jpeg"
                 series_list = book_metadata.get("seriesName", None)
-                added_at = datetime.fromtimestamp(book.get('addedAt')/1000).strftime('%Y-%m-%d')
 
-                # Create the description content with HTML formatting
-                content_text = (
-                    f"{book_metadata.get('description', '')}<br/><br/>"
-                    f"{'Series: ' + series_list + '<br/>' if series_list else ''}"
-                    f"Published year: {book_metadata.get('publishedYear')}<br/>"
-                    f"Genres: {', '.join(book_metadata.get('genres', []))}<br/>"
-                    f"Added at: {added_at}<br/>"
-                )
+                # type="html": the description from ABS is HTML, carried escaped.
+                # DO NOT use type="xhtml" here: Atom then requires an inline
+                # <xhtml:div> child, and readers showed the escaped tags literally.
+                # Everything except the description is plain text, so escape it.
+                lines = [book_metadata.get("description") or ""]
+                if series_list:
+                    lines.append(f"Series: {html.escape(series_list)}")
+                if book_metadata.get("publishedYear"):
+                    lines.append(f"Published year: {html.escape(str(book_metadata['publishedYear']))}")
+                if book_metadata.get("genres"):
+                    lines.append(f"Genres: {html.escape(', '.join(book_metadata['genres']))}")
+                if book.get("addedAt"):
+                    added_at = datetime.fromtimestamp(book["addedAt"] / 1000, timezone.utc)
+                    lines.append(f"Added at: {added_at:%Y-%m-%d}")
+                content_text = "<br/>".join(lines)
 
                 # Set the correct MIME type based on the format
                 # Default to epub if the format is unknown
@@ -259,9 +241,9 @@ class BaseFeedGenerator:
                     "entry": {
                         "title": {"_text": book_title},
                         "id": {"_text": book_id},
-                        "updated": {"_text": self.get_current_timestamp()},
+                        "updated": {"_text": self.format_timestamp(book.get("updatedAt"))},
                         "content": {
-                            "_attrs": {"type": "xhtml"},
+                            "_attrs": {"type": "html"},
                             "_text": content_text
                         },
                         "author": {
@@ -344,8 +326,7 @@ class BaseFeedGenerator:
             n = 1
             filtered_results = []
             for result in data.get("results", []):
-                media = result.get("media", {})
-                if "ebookFormat" in media and media.get("ebookFormat", None):
+                if has_ebook(result):
                     result.update({"opds_seq":n})
                     n += 1
                     filtered_results.append(result)
@@ -354,51 +335,6 @@ class BaseFeedGenerator:
         except Exception as e:
             log_error(e, context="Filtering items for ebooks")
             raise FeedGenerationError(f"Error filtering items: {str(e)}") from e
-
-    def sort_results(self, data):
-        """Sort results based on the opds_seq field.
-
-        Args:
-            data (list): List of items to sort.
-
-        Returns:
-            list: Sorted list of items.
-
-        Raises:
-            FeedGenerationError: If there's an error sorting the results.
-        """
-        try:
-            sorted_results = sorted(
-                    data,
-                    key=lambda x: x["opds_seq"],
-                    reverse=False
-                )
-            return sorted_results
-        except Exception as e:
-            log_error(e, context="Sorting results")
-            raise FeedGenerationError(f"Error sorting results: {str(e)}") from e
-
-    def extract_value(self, item, path):
-        """Extract value from a nested dictionary using a dot-separated path.
-
-        Args:
-            item (dict): The dictionary to extract values from.
-            path (str): Dot-separated path indicating where to find the value.
-
-        Returns:
-            any: The extracted value, or None if the path doesn't exist.
-        """
-        try:
-            keys = path.split('.')
-            for key in keys:
-                item = item.get(key, None)
-                if item is None:
-                    break
-            return item
-        except Exception as e:
-            # Just log here but don't raise as this is a utility function
-            log_error(e, context=f"Extracting value from path {path}")
-            return None
 
     def add_pagination_metadata(self, feed, page, items_per_page, total_items):
         """Add OpenSearch pagination metadata elements to the feed.
@@ -434,8 +370,6 @@ class BaseFeedGenerator:
         """
         total_pages = (total_items + items_per_page - 1) // items_per_page  # Ceiling division
 
-        # Base URL parameters
-        auth_param = f"&token={token}" if token else ""
 
         # Check if current_path already has parameters
         has_params = "?" in current_path
@@ -454,7 +388,7 @@ class BaseFeedGenerator:
                         "rel": "next",
                         "title": "Next Page",
                         "type": "application/atom+xml;profile=opds-catalog",
-                        "href": f"/opds/{current_path}{separator}start_index={next_start_index}{auth_param}"
+                        "href": f"/opds/{current_path}{separator}start_index={next_start_index}"
                     }
                 }
             }
@@ -474,7 +408,7 @@ class BaseFeedGenerator:
                         "rel": "previous",
                         "title": "Previous Page",
                         "type": "application/atom+xml;profile=opds-catalog",
-                        "href": f"/opds/{current_path}{separator}start_index={prev_start_index}{auth_param}"
+                        "href": f"/opds/{current_path}{separator}start_index={prev_start_index}"
                     }
                 }
             }
@@ -515,4 +449,19 @@ class BaseFeedGenerator:
         Returns:
             str: Current timestamp in ISO 8601 format (e.g. 2025-04-21T12:34:56Z)
         """
-        return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    @staticmethod
+    def image_type(url):
+        """MIME type for an image link: our placeholders are PNG, ABS serves JPEG."""
+        return "image/png" if url.split("?", 1)[0].endswith(".png") else "image/jpeg"
+
+    def format_timestamp(self, epoch_ms=None):
+        """Format an ABS epoch-milliseconds timestamp as Atom ``updated``.
+
+        Falls back to now when ABS gives none. Using the real modification time
+        keeps every refresh from looking like every entry changed.
+        """
+        if not epoch_ms:
+            return self.get_current_timestamp()
+        return datetime.fromtimestamp(epoch_ms / 1000, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')

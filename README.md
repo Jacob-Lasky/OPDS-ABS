@@ -1,226 +1,100 @@
-# OPDS Server for Audiobookshelf
+# OPDS server for Audiobookshelf
 
-[![Docstring Check](https://github.com/petr-prikryl/OPDS-ABS/actions/workflows/docstring-check.yml/badge.svg)](https://github.com/petr-prikryl/OPDS-ABS/actions/workflows/docstring-check.yml)
+An OPDS 1.2 catalog in front of [Audiobookshelf](https://www.audiobookshelf.org/), so e-reader
+apps (Marvin, KOReader, PocketBook, Moon+ Reader, Thorium) can browse, search and download the
+ebooks in an ABS library.
 
-This project provides an OPDS (Open Publication Distribution System) server that fetches books from the **Audiobookshelf API** and presents them in OPDS format, making it easy to browse and download books in supported OPDS clients.
+This is a maintained fork of [petr-prikryl/opds-abs](https://github.com/petr-prikryl/opds-abs),
+which is no longer actively maintained. The fork fixed, among other things, an authentication
+bypass (any password worked for a user whose token was cached), ABS tokens embedded in every feed
+link, an OpenSearch description that did not parse for authenticated clients (search never worked
+in Marvin), and pagination that never advanced past page 1 on authors and collections. See
+[issue #1](https://github.com/Jacob-Lasky/opds-abs/issues/1).
 
-## 🚀 Features
-
-- **Fetch books & libraries** from the **Audiobookshelf API**
-- **Supports OPDS** for easy integration with reading apps
-- **Multiple authentication methods**:
-  - Basic auth with Audiobookshelf username and password
-  - API key authentication for better security and flexibility
-  - Bearer token authentication for API clients
-- **Pagination support** for better performance with large libraries
-- **Dockerized** for easy deployment
-- **Lightweight web interface**
-
-## 🚀 To DO
-  -  **Enhanced web interface**
-  -  **Improved Auth**
-
-## Confirmed Working clients
- - **PocketBook Reader iOS and Android**
- - **KOreader**
- - **Moon+ Reader Pro Android**
-
-## � Authentication Methods
-
-OPDS-ABS supports multiple authentication methods to connect to your Audiobookshelf server:
-
-### Username and Password
-
-The standard authentication method using your Audiobookshelf username and password:
-
-```
-Username: your_abs_username
-Password: your_abs_password
-```
-
-This method always works regardless of configuration settings.
-
-### API Key Authentication
-
-For improved security, you can use an API key instead of your password. This is useful for clients where you don't want to store your actual password. **Note: API Key authentication must be enabled with the `API_KEY_AUTH_ENABLED=true` environment variable.**
-
-#### How to Get Your Audiobookshelf API Key
-
-1. Log into your Audiobookshelf web interface
-2. Click on your user icon in the top-right corner
-3. Select "User Settings"
-4. Find the "API Key" section
-5. Copy your existing API key or generate a new one
-
-#### Option 1: Basic Auth with API Key (Recommended for OPDS Clients)
-```
-Username: your_abs_username
-Password: your_audiobookshelf_api_key
-```
-Most OPDS clients support this authentication method. Use your Audiobookshelf API key in place of your password.
-
-#### Option 2: Bearer Token (For API Clients)
-For direct API access, you can use the API key as a Bearer token:
-```
-Authorization: Bearer your_audiobookshelf_api_key
-```
-
-The server will automatically determine your username from the API key by querying Audiobookshelf.
-
-This method matches Audiobookshelf's native API authentication behavior.
-
-### Switching Between Authentication Methods
-
-If you need to switch between different authentication methods, you can use the following environment variables:
-
-1. `API_KEY_AUTH_ENABLED=false` - Disables all API key authentication, forcing the use of username/password only
-2. `AUTH_TOKEN_CACHING=false` - Disables token caching, ensuring each request is authenticated fresh (useful when testing)
-
-## �🛠 Installation & Usage
-
-### 1️⃣ **Clone the repository**
-
-```bash
-git clone https://github.com/petr-prikryl/opds-abs.git
-cd opds-abs
-```
-
-### 2️⃣ **Run with Docker Compose**
-
-Ensure **Docker** and **Docker Compose** are installed, then run:
-
-```bash
-docker-compose up -d
-```
-
-This will start the OPDS server.
-
-### 3️⃣ **Access the OPDS feed**
-
-- **OPDS Root:** `http://localhost:8000/opds/`
-- **Web Interface:** `http://localhost:8000/`
-
-You can use an OPDS-compatible reader (e.g., **Calibre, KOReader, Thorium Reader**) to access your books.
-
-## ⚙ Configuration
-
-You can configure the server using environment variables in your docker-compose.yml file:
-
-```yaml
-services:
-  opds:
-     environment:
-      # User/Group settings for proper file permissions
-      - PUID=1000  # Set to your user's UID
-      - PGID=1000  # Set to your user's GID
-
-      # Connection settings
-      # Legacy: AUDIOBOOKSHELF_URL is supported for backward compatibility
-      # - AUDIOBOOKSHELF_URL=http://audiobookshelf:13378
-      # Recommended: set internal and/or external URLs
-      - AUDIOBOOKSHELF_INTERNAL_URL=http://audiobookshelf
-      - AUDIOBOOKSHELF_EXTERNAL_URL=http://abs.example.com
-
-      # Feature toggles
-      - AUTH_ENABLED=true
-      - API_KEY_AUTH_ENABLED=true
-      - CACHE_PERSISTENCE_ENABLED=true
-
-      # Performance settings
-      - OPDS_LOG_LEVEL=INFO
-      - ITEMS_PER_PAGE=25  # Set to 0 to disable pagination
-```
-
-### Configuration Options
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `AUDIOBOOKSHELF_URL` | (Legacy) Main URL of your Audiobookshelf server. If set, used for both internal and external. | `http://localhost` |
-| `AUDIOBOOKSHELF_INTERNAL_URL` | Internal URL for container-to-container communication. If only this or EXTERNAL is set, that value is used for both. | `http://localhost` |
-| `AUDIOBOOKSHELF_EXTERNAL_URL` | External URL for client downloads and images. If only this or INTERNAL is set, that value is used for both. | `http://localhost` |
-| `AUTH_ENABLED` | Enable/disable authentication | `true` |
-| `API_KEY_AUTH_ENABLED` | Enable/disable API key authentication (set to `false` to only allow username/password) | `true` |
-| `AUTH_TOKEN_CACHING` | Enable/disable token caching (set to `false` to force re-authentication on each request) | `true` |
-| `PAGINATION_ENABLED` | Enable/disable pagination entirely (overrides ITEMS_PER_PAGE) | `true` |
-| `PUID` | User ID for file ownership | `1000` |
-| `PGID` | Group ID for file ownership | `1000` |
-| `ITEMS_PER_PAGE` | Number of items per page, 0 to disable pagination | `25` |
-| `OPDS_LOG_LEVEL` | Logging level (DEBUG, INFO, WARNING, ERROR) | `INFO` |
-| `CACHE_PERSISTENCE_ENABLED` | Enable/disable cache persistence | `true` |
-
-## 🐳 Running from GitHub Container Registry (GHCR)
-
-You can use the pre-built Docker image:
-
+## Run
 
 ```bash
 docker run -d -p 8000:8000 \
-  --env AUDIOBOOKSHELF_INTERNAL_URL=http://audiobookshelf:13378 \
-  --env AUDIOBOOKSHELF_EXTERNAL_URL=http://abs.hlm.ing:13378 \
-  --env PUID=$(id -u) \
-  --env PGID=$(id -g) \
-  --volume ./data:/app/opds_abs/data \
-  ghcr.io/petr-prikryl/opds-abs:latest
+  -e AUDIOBOOKSHELF_INTERNAL_URL=http://audiobookshelf:80 \
+  -e AUDIOBOOKSHELF_EXTERNAL_URL=https://abs.example.com \
+  -e PUID=$(id -u) -e PGID=$(id -g) \
+  -v ./data:/app/opds_abs/data \
+  ghcr.io/jacob-lasky/opds-abs:latest
 ```
 
-# Legacy support
-# You may still use AUDIOBOOKSHELF_URL for both internal and external if desired.
+or `docker compose up -d` with the included `docker-compose.yml`. Images are published from
+`master` as `:latest` and `:sha-<commit>`; pin the sha tag if you want to choose when to upgrade.
 
-Or use `docker-compose.yml` directly:
+Point the reader at `https://<host>/opds` and give it your Audiobookshelf username and password.
+
+## Authentication
+
+Readers authenticate with HTTP Basic, checked against Audiobookshelf's `/login`. Every catalog
+request without valid credentials gets a `401` Basic challenge, which is what makes readers send
+their stored credentials. The resulting ABS token is cached in memory, keyed by a hash of the
+username **and** password, and never written to disk or into a URL.
+
+With `API_KEY_AUTH_ENABLED=true` an Audiobookshelf API key (created under ABS Settings, API Keys)
+is also accepted, as the Basic password, as `Authorization: Bearer <key>`, or as `?token=<key>`
+for clients that cannot send headers. Leave it off unless a client needs it.
+
+`/opds/<user>/libraries/<id>/search.xml` (the OpenSearch description) is served without auth: it
+contains nothing that is not already in its URL, and some readers fetch it without credentials.
+
+The `/admin/cache/*` endpoints require an ABS `root` or `admin` account.
+
+## Configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `AUDIOBOOKSHELF_INTERNAL_URL` | `http://localhost` | URL this server uses to call ABS. |
+| `AUDIOBOOKSHELF_EXTERNAL_URL` | internal URL | URL readers use for covers and images. |
+| `AUDIOBOOKSHELF_URL` | | Legacy: sets both of the above. |
+| `AUTH_ENABLED` | `true` | Require ABS credentials. |
+| `API_KEY_AUTH_ENABLED` | `true` | Also accept ABS API keys (see above). |
+| `AUTH_TOKEN_CACHING` | `true` | Cache ABS tokens in memory per credential. |
+| `AUTH_CACHE_EXPIRY` | `3600` | Seconds verified credentials are reused before checking ABS again; also how long an old password keeps working after a change. |
+| `PAGINATION_ENABLED` | `true` | Paginate large feeds. |
+| `ITEMS_PER_PAGE` | `25` | Page size; `0` disables pagination. |
+| `CACHE_PERSISTENCE_ENABLED` | `true` | Persist the ABS response cache to `data/cache.pkl`. |
+| `OPDS_LOG_LEVEL` | `INFO` | `DEBUG` adds upstream calls and cache hits. |
+| `OPDS_LOG_FORMAT` | `timestamped` | `plain` drops timestamps for collectors that add their own. |
+| `FORWARDED_ALLOW_IPS` | `*` | Proxies trusted for `X-Forwarded-Proto/For`. Needed behind a reverse proxy so the search template advertises `https`. Narrow it if the port is reachable directly. |
+| `PUID` / `PGID` | `1000` | Ownership of the data directory. |
+
+## Logging
+
+One line per request on stdout:
+
+```
+2026-10-16T14:59:11+0000 INFO    req=097696c5 opds_abs.access: GET /opds/alice/libraries/<id>/search?q=harry+potter -> 200 14000B 52ms user=alice auth=cache ip=203.0.113.7 ua="Marvin/3.6"
+```
+
+`auth=` is `password`, `apikey`, `cache` (credentials matched a cached login), `none` (no
+credentials sent, answered with a challenge), `basic-rejected`, or `abs-unavailable`. Detail lines
+from the same request (search terms and result counts, downloads, upstream errors) carry the same
+`req=` id, which is also returned as the `X-Request-ID` response header and as the `<id>` of XML
+error responses. Secrets in query strings are redacted.
+
+## Development
 
 ```bash
-curl -o docker-compose.yml https://raw.githubusercontent.com/petr-prikryl/OPDS-ABS/refs/heads/master/docker-compose.yml
-docker-compose up -d
+uv venv --python 3.15 .venv
+uv pip install --python .venv/bin/python -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pytest -q          # runs against an in-process fake Audiobookshelf
+.venv/bin/python -m pyflakes opds_abs run.py tests
 ```
 
-## 📦 Advanced Docker Usage
+Runtime dependencies are declared in `requirements.in` and hash-pinned in `requirements.txt`
+(regenerate with the command at the top of `requirements.in`).
 
-### Custom User Permissions
-
-The Docker container supports custom user IDs to ensure proper file ownership when mounting volumes:
+To check a live deployment the way a reader experiences it, walk every paginated feed and the
+search path:
 
 ```bash
-# Find your user and group IDs
-id -u  # Your user ID (PUID)
-id -g  # Your group ID (PGID)
+OPDS_USER=alice OPDS_PASSWORD=... python3 scripts/walk_feeds.py \
+  --base https://opds.example.com --library <library-id> --search "harry potter"
 ```
 
-Update your docker-compose.yml with these values to ensure proper file permissions.
-
-### Pagination
-
-You can control pagination behavior through two environment variables:
-
-- `PAGINATION_ENABLED`: Set to `false` to completely disable pagination across all feeds
-- `ITEMS_PER_PAGE`: Set a positive number (e.g., 25) for page size, or 0 to disable pagination but keep the option
-
-For most users, setting `PAGINATION_ENABLED=false` is the simplest way to disable pagination completely. Using `ITEMS_PER_PAGE=0` is an alternative that keeps the pagination code active but shows all items.
-
-Pagination helps improve performance and load times when dealing with large libraries, but disabling it can be useful for smaller libraries or when using clients that work better with complete feeds.
-
-## 🙌 Contributing
-
-Pull requests are welcome! If you find a bug or want to suggest improvements, open an **issue** on GitHub.
-
-### Development Setup
-
-1. Install development dependencies:
-   ```bash
-   pip install -r requirements-dev.txt
-   ```
-
-2. Set up pre-commit hooks:
-   ```bash
-   pre-commit install
-   ```
-
-3. Before submitting a PR, ensure your code passes all checks:
-   ```bash
-   ./docstring-check.py
-   ```
-
-For more information about our documentation standards, see [DOCS_STANDARDS.md](DOCS_STANDARDS.md).
-
----
-
-Made with ❤️ for Audiobookshelf users.
+It fails on pages that repeat, counts that disagree with `opensearch:totalResults`, a search
+description that does not parse, and auth that accepts missing or wrong credentials.

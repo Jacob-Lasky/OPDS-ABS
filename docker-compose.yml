@@ -1,25 +1,18 @@
-version: '3.8'
 services:
   opds:
-    image: opds-abs:latest
+    image: ghcr.io/jacob-lasky/opds-abs:latest
     container_name: opds-abs
     restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
-      # User/Group settings
-      - PUID=1000  # Set to your user's UID for proper file permissions
-      - PGID=1000  # Set to your user's GID for proper file permissions
-      # Application settings
-      # Legacy: AUDIOBOOKSHELF_URL is supported for backward compatibility
-      # - AUDIOBOOKSHELF_URL=http://audiobookshelf
+      - PUID=1000
+      - PGID=1000
       - AUDIOBOOKSHELF_INTERNAL_URL=http://audiobookshelf
       - AUDIOBOOKSHELF_EXTERNAL_URL=https://abs.example.com
       - AUTH_ENABLED=true
-      - API_KEY_AUTH_ENABLED=true
-      - OPDS_LOG_LEVEL=INFO
+      - API_KEY_AUTH_ENABLED=false
       - CACHE_PERSISTENCE_ENABLED=true
-      - PAGINATION_ENABLED=true
-      - ITEMS_PER_PAGE=25  # Set to 0 to show all items but keep pagination links
+      - ITEMS_PER_PAGE=25
     volumes:
-      - ./opds_abs/data:/app/opds_abs/data
+      - ./data:/app/opds_abs/data

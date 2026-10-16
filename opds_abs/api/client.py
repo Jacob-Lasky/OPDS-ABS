@@ -11,7 +11,6 @@ import aiohttp
 from opds_abs.config import (
     AUDIOBOOKSHELF_API,
     AUDIOBOOKSHELF_INTERNAL_URL,
-    AUDIOBOOKSHELF_EXTERNAL_URL,
     AUTH_ENABLED,
     AUTHORS_CACHE_EXPIRY,
     COLLECTIONS_CACHE_EXPIRY,
@@ -21,9 +20,9 @@ from opds_abs.config import (
     SEARCH_RESULTS_CACHE_EXPIRY,
     SERIES_DETAILS_CACHE_EXPIRY
 )
-from opds_abs.utils.cache_utils import _create_cache_key, cache_get, cache_set, cached, _cache
-from opds_abs.utils.error_utils import AuthenticationError, APIClientError, log_error
-from opds_abs.utils.auth_utils import get_token_for_username, TOKEN_CACHE
+from opds_abs.utils.cache_utils import _create_cache_key, cache_get, cache_set
+from opds_abs.utils.error_utils import AuthenticationError, APIClientError, ResourceNotFoundError, log_error
+from opds_abs.utils.auth_utils import invalidate_token
 
 logger = logging.getLogger(__name__)
 
@@ -64,25 +63,10 @@ async def fetch_from_api(
     """
     params = params.copy() if params else {}
 
-    # Try to get a token if one wasn't provided
-    if token is None and username is not None:
-        # Check if token is in the params
-        if 'token' in params:
-            token = params.pop('token')  # Extract and remove from params
-            logger.debug("Using token from params for user %s", username)
-        # Check if api_key is in the params
-        elif 'api_key' in params:
-            token = params.pop('api_key')  # Use API key as token
-            logger.debug("Using API key from params for user %s", username)
-        else:
-            # Try to get from the TOKEN_CACHE
-            token = get_token_for_username(username)
-            logger.debug("Token from cache for user %s: %s", username, 'Found' if token else 'Not found')
-
-        # If no token from cache and authentication is enabled, we have a problem
-        if token is None and AUTH_ENABLED:
-            logger.error("No cached token available for user %s", username)
-            raise AuthenticationError("No authentication token available for user %s" % username)
+    # The token always comes from the authenticated request. DO NOT look one up by
+    # username: that fallback served users' catalogs to anonymous callers (#1).
+    if token is None and AUTH_ENABLED:
+        raise AuthenticationError("No authentication token for API call to %s" % endpoint)
 
     # If authentication is disabled, proceed without a token
     if not AUTH_ENABLED:
@@ -96,7 +80,7 @@ async def fetch_from_api(
         headers["Authorization"] = auth_header
         logger.debug("Using Bearer token authentication for API call to %s", endpoint)
     else:
-        logger.warning("No token for API call to %s", endpoint)
+        logger.debug("No token for API call to %s (auth disabled)", endpoint)
 
     # Determine the cache expiry time based on the endpoint
     cache_expiry = DEFAULT_CACHE_EXPIRY
@@ -106,7 +90,7 @@ async def fetch_from_api(
             break
 
     # Create a cache key for this request
-    cache_key = _create_cache_key(endpoint, params, username)
+    cache_key = _create_cache_key(endpoint, params, username, token)
 
     # Try to get from cache if not bypassing
     if not bypass_cache:
@@ -120,8 +104,9 @@ async def fetch_from_api(
     logger.debug("📡 Fetching: %s%s", url, ' with params ' + str(params) if params else '')
 
     try:
-        # Use a shorter timeout for faster failure detection when server is down
-        timeout = aiohttp.ClientTimeout(total=5)
+        # Connect fails fast when ABS is down; the read allows for the all-items
+        # fetch of a large library, which a 5s total timeout used to cut off.
+        timeout = aiohttp.ClientTimeout(total=60, sock_connect=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.get(
@@ -136,28 +121,28 @@ async def fetch_from_api(
                     cache_set(cache_key, data)
                     return data
             except asyncio.TimeoutError as timeout_error:
-                context = f"API call to {url}"
                 logger.error("Timeout connecting to Audiobookshelf API at %s", url)
                 raise APIClientError(
-                    f"Audiobookshelf server is not responding. Please ensure it's running and accessible."
+                    "Audiobookshelf server is not responding. Please ensure it's running and accessible."
                 ) from timeout_error
             except aiohttp.ClientResponseError as resp_error:
-                context = f"API call to {url}"
-                log_error(resp_error, context=context)
+                logger.warning("Audiobookshelf returned HTTP %d for %s", resp_error.status, endpoint)
 
                 # Check if this might be an authentication error
                 if resp_error.status in (401, 403):
                     token_info = "Token present" if token else "No token"
                     logger.error("Authentication error (%s) for %s: %s", token_info, url, str(resp_error))
 
-                    # Invalidate token cache on auth errors to force re-authentication
-                    if username and username in TOKEN_CACHE:
-                        del TOKEN_CACHE[username]
-                        logger.debug("Invalidated token cache for %s due to auth error", username)
+                    # Forget the token so the next request re-authenticates
+                    if token:
+                        invalidate_token(token)
 
                     raise AuthenticationError(
                         f"Authentication failed for Audiobookshelf API: {str(resp_error)}"
                     ) from resp_error
+
+                if resp_error.status == 404:
+                    raise ResourceNotFoundError(f"Not found in Audiobookshelf: {endpoint}") from resp_error
 
                 # For other response errors, provide a clearer message
                 error_msg = f"Audiobookshelf API error (status {resp_error.status}): {str(resp_error)}"
@@ -185,14 +170,14 @@ async def fetch_from_api(
         raise APIClientError(
             f"Cannot connect to Audiobookshelf server at {host_info}. Please ensure it's running and accessible."
         ) from None  # Use "from None" to suppress the traceback in the logs
+    except (AuthenticationError, ResourceNotFoundError, APIClientError):
+        raise  # already classified above; DO NOT let the catch-all turn a 401/404 into a 503
     except Exception as e:
-        context = f"API call to {url}"
-        log_error(e, context=context)
+        log_error(e, context=f"API call to {url}")
         raise APIClientError(
             f"Error communicating with Audiobookshelf API: {str(e)}"
         ) from e
 
-@cached(expiry=LIBRARY_ITEMS_CACHE_EXPIRY)
 async def get_download_urls_from_item(
     item_id: str,
     username: str = None,
@@ -214,17 +199,12 @@ async def get_download_urls_from_item(
             - ino: The inode number of the file
             - filename: The filename of the ebook
             - download_url: An empty string (filled in later)
-            - token: The token used for authentication
+
+    Not wrapped in @cached: fetch_from_api already caches successful responses,
+    and a cache around this function also stored the [] it returns on error, which
+    hid the book from every feed for 30 minutes after one upstream hiccup.
     """
     try:
-        # Log authentication information for debugging
-        logger.debug("Getting download URLs for item %s, username: %s, token present: %s", item_id, username, token is not None)
-
-        if token is None and username:
-            cached_token = get_token_for_username(username)
-            token = cached_token  # Use the cached token if available
-            logger.debug("No token provided for download, using cached token: %s", cached_token is not None)
-
         item = await fetch_from_api(f"/items/{item_id}", username=username, token=token)
         ebook_inos = []
         for file in item.get("libraryFiles", []):
@@ -233,29 +213,14 @@ async def get_download_urls_from_item(
                     "ino":          file.get("ino"),
                     "filename":     file.get("metadata", {}).get("filename", ""),
                     "download_url": "",
-                    "token":        token  # Store the token with the file info
                 }
                 ebook_inos.append(file_info)
                 logger.debug("Found ebook file: %s (ino: %s)", file_info['filename'], file_info['ino'])
 
         logger.debug("Found %d ebook files for item %s", len(ebook_inos), item_id)
         return ebook_inos
+    except AuthenticationError:
+        raise
     except Exception as e:
-        log_error(e, context="Getting download URLs for item %s" % item_id)
+        logger.warning("Could not list ebook files for item %s, omitting it from this feed: %s", item_id, e)
         return []
-
-def invalidate_cache(endpoint: str = None, params: dict = None, username: str = None):
-    """Invalidate cache for a specific endpoint or item.
-
-    Args:
-        endpoint: API endpoint to invalidate cache for (if None, key must be provided)
-        params: Query parameters (optional)
-        username: Username for user-specific cache (optional)
-    """
-    if endpoint:
-        cache_key = _create_cache_key(endpoint, params, username)
-        if cache_key in _cache:
-            del _cache[cache_key]
-            logger.debug("Invalidated cache for %s", endpoint)
-            return True
-    return False

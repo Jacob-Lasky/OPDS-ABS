@@ -1,6 +1,5 @@
--r requirements.txt
-pylint
-pydocstyle
-flake8
-flake8-docstrings
-pre-commit
+# Test/lint tools, installed on top of requirements.txt (which is hash-pinned,
+# so the two are installed with separate pip invocations).
+pytest==9.1.1
+httpx2==2.13.1
+pyflakes==4.0.3

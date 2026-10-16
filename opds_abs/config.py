@@ -27,12 +27,16 @@ else:
 	AUDIOBOOKSHELF_INTERNAL_URL = _abs_internal or "http://localhost"
 	AUDIOBOOKSHELF_EXTERNAL_URL = _abs_external or AUDIOBOOKSHELF_INTERNAL_URL
 
-# API endpoints
+# API endpoints. INTERNAL is what this server calls; EXTERNAL is what goes into
+# feeds (covers, images), because the e-reader fetches those itself.
 AUDIOBOOKSHELF_API = AUDIOBOOKSHELF_INTERNAL_URL + "/api"
+AUDIOBOOKSHELF_EXTERNAL_API = AUDIOBOOKSHELF_EXTERNAL_URL + "/api"
 
 # Authentication configuration
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
-AUTH_CACHE_EXPIRY = int(os.getenv("AUTH_CACHE_EXPIRY", "86400"))  # Default: 24 hours
+# Seconds a verified username+password is trusted without asking ABS again. Also how
+# long an old password keeps working after a password change, so keep it short.
+AUTH_CACHE_EXPIRY = int(os.getenv("AUTH_CACHE_EXPIRY", "3600"))
 API_KEY_AUTH_ENABLED = os.getenv("API_KEY_AUTH_ENABLED", "true").lower() == "true"  # Enable API key authentication
 AUTH_TOKEN_CACHING = os.getenv("AUTH_TOKEN_CACHING", "true").lower() == "true"  # Enable token caching
 
@@ -57,3 +61,12 @@ ITEMS_PER_PAGE = int(os.getenv("ITEMS_PER_PAGE", "25"))  # Default: 25 items per
 
 # Logging configuration
 LOG_LEVEL = os.environ.get("OPDS_LOG_LEVEL", "INFO").upper()
+# "timestamped" (default) or "plain" (no timestamp, for collectors that add their own)
+LOG_FORMAT = os.environ.get("OPDS_LOG_FORMAT", "timestamped").lower()
+
+# Server configuration
+# Proxies whose X-Forwarded-Proto/For headers are trusted. Behind a reverse proxy the
+# OpenSearch description must advertise the public https URL, which needs these.
+FORWARDED_ALLOW_IPS = os.environ.get("FORWARDED_ALLOW_IPS", "*")
+# Development only: restart the server when source files change.
+DEV_RELOAD = os.environ.get("DEV_RELOAD", "false").lower() == "true"
