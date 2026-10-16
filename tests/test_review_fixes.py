@@ -99,3 +99,18 @@ def test_slow_save_cannot_overwrite_a_later_clear(tmp_path, monkeypatch):
     t.join()
     cache_utils.load_cache_from_disk()
     assert "stale" not in cache_utils._cache
+
+
+def test_content_disposition_raw_latin1_from_older_abs():
+    """Older ABS sent latin-1 bytes; aiohttp hands them over surrogate-escaped (upstream #42)."""
+    from opds_abs.main import _content_disposition
+    v = _content_disposition('attachment; filename="M\udcfcller.epub"', "x.epub")
+    assert "filename*=UTF-8''M%C3%BCller.epub" in v and 'filename="Muller.epub"' in v
+
+
+def test_content_disposition_prefers_rfc5987_from_current_abs():
+    """ABS 2.37 sends an ASCII fallback with '?' plus filename*; the real name must win."""
+    from opds_abs.main import _content_disposition
+    v = _content_disposition(
+        "attachment; filename=\"Ranger?s.epub\"; filename*=UTF-8''Ranger%E2%80%99s.epub", "x.epub")
+    assert "filename*=UTF-8''Ranger%E2%80%99s.epub" in v

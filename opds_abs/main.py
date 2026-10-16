@@ -46,6 +46,7 @@ import logging
 import time
 import atexit
 from email.message import Message
+from email.utils import collapse_rfc2231_value
 import os
 import re
 import unicodedata
@@ -704,6 +705,21 @@ async def clear_all_cache(auth_info: tuple = Depends(require_admin)):
 _ABS_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
+def _recover_header_text(value: str) -> str:
+    """Undo aiohttp's decoding of a raw header so non-ASCII text reads correctly.
+
+    aiohttp decodes header bytes as UTF-8 with ``surrogateescape``. Older ABS
+    (Node) wrote filenames as raw latin-1, so "Müller" arrived as "M\\udcfcller"
+    and became "M\\ufffdller" (upstream issue #42). Recover the bytes, then
+    decode as UTF-8 if valid, else latin-1.
+    """
+    raw = value.encode("utf-8", "surrogateescape")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
 def _content_disposition(upstream_value: str, fallback: str) -> str:
     """Build a Content-Disposition that survives non-ASCII filenames.
 
@@ -715,8 +731,19 @@ def _content_disposition(upstream_value: str, fallback: str) -> str:
     "foo;bar.epub" down to "foo".
     """
     msg = Message()
-    msg["content-disposition"] = upstream_value or ""
-    name = (msg.get_filename() or "").replace("\r", "").replace("\n", "").strip() or fallback
+    msg["content-disposition"] = _recover_header_text(upstream_value or "")
+    # get_params decodes RFC 2231 `filename*` into a (charset, lang, value) tuple
+    # listed under "filename" beside the plain one. Prefer the tuple. DO NOT use
+    # msg.get_filename(): it returns the plain `filename`, which current ABS fills
+    # with an ASCII fallback ("Ranger?s").
+    candidates = [v for k, v in (msg.get_params(header="content-disposition") or [])
+                  if k.lower() == "filename"]
+    extended = [v for v in candidates if isinstance(v, tuple)]
+    if extended:
+        name = collapse_rfc2231_value(extended[0])
+    else:
+        name = collapse_rfc2231_value(candidates[0]) if candidates else ""
+    name = name.replace("\r", "").replace("\n", "").strip() or fallback
     ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
     ascii_name = re.sub(r'["\\\r\n]', "", ascii_name).strip() or fallback
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name, safe='')}"
